@@ -184,7 +184,7 @@ function CardNode({
       // 「双击放大画布」的监听挂在画布容器上，双击节点会冒泡上去，顺带把画布
       // 放大一级。而 d3-zoom 的 filter 只认 nopan/nowheel 两个类，不认 nodrag。
       className={[
-        "group relative flex flex-col rounded-xl border bg-[color:var(--surface-1)] transition-colors nopan",
+        "group relative flex flex-col rounded-3xl border-2 bg-[color:var(--surface-1)] transition-colors nopan",
         // 选中态：边框提亮到 --line-3 + 一圈白 10% 的 ring。
         // 原来用的是「黑边 + 淡黑 ring」—— 在近黑背景上这两种深浅都看不见。
         selected
@@ -197,10 +197,10 @@ function CardNode({
       {/* 头部：类型名 + 状态。高度写死 40px，是三段式里唯一不伸缩的一段 */}
       <div
         data-card-header="1"
-        className="flex h-10 shrink-0 items-center gap-2 border-b border-[color:var(--line-1)] px-3"
+        className="flex h-16 shrink-0 items-center gap-2 border-b border-[color:var(--line-1)] px-9"
       >
         <span
-          className={`shrink-0 rounded px-2 py-0.5 text-[length:var(--fs-card-chrome)] font-medium leading-none ${def?.badge ?? "bg-[color:var(--surface-2)] text-[color:var(--ink-2)]"}`}
+          className={`shrink-0 rounded-lg px-3 py-1 text-[length:var(--fs-card-chrome)] font-medium leading-none ${def?.badge ?? "bg-[color:var(--surface-2)] text-[color:var(--ink-2)]"}`}
         >
           {def?.label ?? type}
         </span>
@@ -229,7 +229,7 @@ function CardNode({
         */}
         {statusKey !== NODE_STATUS.IDLE && (
           <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[length:var(--fs-card-chrome)] text-[color:var(--ink-3)]">
-            <span className={`h-3 w-3 rounded-full ${status.dot}`} />
+            <span className={`h-8 w-8 rounded-full ${status.dot}`} />
             {status.text}
           </span>
         )}
@@ -258,13 +258,14 @@ function CardNode({
          * 都不再缩放画布 —— 那更烦。所以只读态按「摘要」处理，
          * 想看全文双击进去，那里是真正的 textarea，自带 nowheel 和滚动。
          *
-         * clamp 取 13 行：主体 686px（768 减头部 40、底栏 40、上下边框 2）
-         * 减去上下 padding 20px 得 666px，30px 字号配 1.625 行高（48.75px）
-         * 装得下 13 行（633.75px），第 14 行（682.5px）会溢出，截断点落在卡片边缘上。
+         * clamp 取 12 行：主体 636px（768 减头部 64、底栏 64、上下边框 4）
+         * 减去上下 padding 48px 得 588px，30px 字号配 1.625 行高（48.75px）
+         * 装得下 12 行（585px），第 13 行（633.75px）会溢出，截断点落在卡片边缘上。
          *
-         * 这个数字和底栏高度是**绑死的**：2026-10-26 底栏曾为了装一个 72px 的
-         * 方形叉号加高到 88（正文降到 12 行），当晚叉号搬到右上角后底栏回到 40，
-         * 行数也回到 13。改任何一边都要同步改另一边，
+         * 这个数字和头 / 底栏高度是**绑死的**：2026-10-26 底栏曾为了装一个 72px 的
+         * 方形叉号加高到 88（正文降到 12 行），当晚叉号搬到右上角后底栏回到 40。
+         * 同日按 UI 军规把头部 / 底栏一起提到 64（32px 字在 40 里只上下各留 4px，
+         * 太挤），正文 clamp 相应降到 12 行。改任何一边都要同步改另一边，
          * 否则症状是「最后一行被从半个字处切断」，而 clamp 值看着毫无问题。
          *
          * 字号调过六轮：12 → 15 → 28 → 22 → 26 → 30。判据也换了两次：
@@ -276,7 +277,7 @@ function CardNode({
          * → 30px 时 13 行约 430 字（33 字/行）。超过的部分只读态被截断，
          * 双击进编辑态仍能滚。**这是「字大」必须付的价**，不是 bug。
          */
-        <div data-card-body="1" className="relative min-h-0 flex-1 overflow-hidden px-3 py-2.5">
+        <div data-card-body="1" className="relative min-h-0 flex-1 overflow-hidden px-9 py-6">
           <p
             className={[
               "whitespace-pre-wrap text-[length:var(--fs-body)] leading-relaxed",
@@ -288,7 +289,7 @@ function CardNode({
                * 正文一路写到卡片底边、被 overflow-hidden 从半行处切断，
                * 还没有省略号。看起来像「风格问题」，其实是类名根本不存在。
                */
-              bodyText ? "line-clamp-[13] text-[color:var(--ink-1)]" : "text-[color:var(--ink-3)]",
+              bodyText ? "line-clamp-[12] text-[color:var(--ink-1)]" : "text-[color:var(--ink-3)]",
             ].join(" ")}
           >
             {bodyText || "双击这里写内容"}
@@ -308,7 +309,7 @@ function CardNode({
       */}
       <div
         data-card-footer="1"
-        className="flex h-10 shrink-0 items-center gap-1.5 border-t border-[color:var(--line-1)] px-2.5"
+        className="flex h-16 shrink-0 items-center gap-1.5 border-t border-[color:var(--line-1)] px-9"
       >
         {/*
           「AI 优化」标记放在这里而不是正文角落：正文会一直写到卡片右边界，
@@ -324,7 +325,7 @@ function CardNode({
               <span
                 data-optimized="1"
                 title="这段是 AI 根据你的原始描述改写过的。原始描述在选中后的面板里"
-                className="shrink-0 rounded bg-sky-50 px-1.5 py-0.5 leading-none text-sky-600"
+                className="shrink-0 rounded-lg bg-sky-950/90 px-3 py-1.5 leading-none text-sky-300"
               >
                 AI 优化
               </span>
@@ -350,7 +351,7 @@ function CardNode({
       */}
       {statusKey === NODE_STATUS.RUNNING && (
         <div
-          className="absolute inset-x-0 bottom-0 h-1 overflow-hidden rounded-b-xl bg-[color:var(--surface-2)]"
+          className="absolute inset-x-0 bottom-0 h-1 overflow-hidden rounded-b-3xl bg-[color:var(--surface-2)]"
           data-progress={Math.round((rt?.progress ?? 0) * 100)}
         >
           <div

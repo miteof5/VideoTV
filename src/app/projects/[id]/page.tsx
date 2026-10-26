@@ -66,6 +66,20 @@ export default async function ProjectPage({
     };
   }
 
+  // 上次离开时的视野。三列必须同时有值才算有效存档 ——
+  // 只校验 viewSpan 就够了吗？不够：早期写入若中断，可能只留下一部分。
+  // 三列一起判，宁可退回自动取景，也不要拿半个坐标去还原出一个歪掉的视野。
+  const initialViewport =
+    project.viewSpan !== null &&
+    project.viewCenterX !== null &&
+    project.viewCenterY !== null
+      ? {
+          centerX: project.viewCenterX,
+          centerY: project.viewCenterY,
+          span: project.viewSpan,
+        }
+      : null;
+
   return (
     <main className="flex h-screen flex-col">
       <header className="flex shrink-0 items-center gap-3 border-b border-[color:var(--line-1)] bg-[color:var(--surface-1)] px-6 py-3">
@@ -87,6 +101,7 @@ export default async function ProjectPage({
           initialNodes={initialNodes}
           initialEdges={initialEdges}
           initialRuntime={initialRuntime}
+          initialViewport={initialViewport}
         />
       </div>
     </main>

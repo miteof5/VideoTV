@@ -103,30 +103,67 @@ export function fitViewportFromBoxes(
 }
 
 /**
- * 从 preferred 开始找一块不压住任何已有节点的位置。
- * 冲突时向右下螺旋挪动，最多尝试 24 次；实在找不到就返回最后一次的候选。
+ * 落库的视野。三个数都是**画布坐标（设计像素）**，与窗口尺寸无关 ——
+ * 这是它能在不同大小的窗口里还原出同样构图的原因。
  */
-export function findFreeSpot(
-  occupied: Point[],
-  preferred: Point,
-  width = NODE_WIDTH,
-  height = NODE_HEIGHT
-): Point {
-  const candidate: Point = { ...preferred };
-
-  for (let i = 0; i < 24; i++) {
-    const hit = occupied.some(
-      (p) =>
-        // 两个矩形重叠的充要条件：水平方向有交集 且 垂直方向有交集
-        Math.abs(p.x - candidate.x) < width &&
-        Math.abs(p.y - candidate.y) < height
-    );
-    if (!hit) return candidate;
-
-    // 向右下错开：横向加半格、纵向加一整格，形成瀑布式排布
-    candidate.x += width / 2;
-    candidate.y += height * 0.62;
-  }
-
-  return candidate;
+export interface SavedViewport {
+  /** 视口中心落在画布的哪个世界坐标上 */
+  centerX: number;
+  centerY: number;
+  /**
+   * 一个画布宽度覆盖多少个设计像素。等价于 `画布宽 ÷ zoom`。
+   *
+   * 为什么不直接存 zoom：zoom 会随窗口尺寸变，同一份内容在 1920 窗口要 0.349、
+   * 在 1080 窗口要 0.196。存死 zoom 等于把当时的窗口一起存了，换屏打开就偏。
+   */
+  span: number;
 }
+
+/**
+ * 当前视野 → 存档。与 `viewportFromSaved` 互逆（zoom 未被夹住时逐位相等）。
+ *
+ * `Viewport.x/y` 是 React Flow 的平移量，屏幕坐标 = 世界坐标 × zoom + x。
+ * 所以「屏幕中心对应的世界坐标」= (画布宽/2 − x) ÷ zoom。
+ */
+export function savedFromViewport(
+  vp: Viewport,
+  canvas: { w: number; h: number }
+): SavedViewport | null {
+  if (!(vp.zoom > 0) || canvas.w <= 0 || canvas.h <= 0) return null;
+  if (!Number.isFinite(vp.x) || !Number.isFinite(vp.y)) return null;
+  return {
+    centerX: (canvas.w / 2 - vp.x) / vp.zoom,
+    centerY: (canvas.h / 2 - vp.y) / vp.zoom,
+    span: canvas.w / vp.zoom,
+  };
+}
+
+/**
+ * 存档 → 当前窗口的视野。
+ *
+ * 关键在 `zoom = 画布宽 ÷ span`：窗口变宽，zoom 跟着变大，**内容占屏宽的比例不变**。
+ * 所以 1920 上存下的构图，换到 1080 打开还是同样的构图，不会「只能看到一半」。
+ *
+ * 夹 [minZoom, maxZoom] 是必须的：存档可能来自一次极端缩放
+ * （比如窗口从 2560 缩到 900 时 span 很小），不夹会算出 react-flow 不接受的 zoom。
+ * 夹住之后构图会偏 —— 但这是「窗口小到装不下」的必然代价，比画不出来好。
+ */
+export function viewportFromSaved(
+  saved: SavedViewport,
+  canvas: { w: number; h: number },
+  limits: { minZoom: number; maxZoom: number }
+): Viewport | null {
+  if (canvas.w <= 0 || canvas.h <= 0) return null;
+  if (!(saved.span > 0)) return null;
+  if (!Number.isFinite(saved.centerX) || !Number.isFinite(saved.centerY)) return null;
+
+  const raw = canvas.w / saved.span;
+  const zoom = Math.min(limits.maxZoom, Math.max(limits.minZoom, raw));
+
+  return {
+    x: canvas.w / 2 - saved.centerX * zoom,
+    y: canvas.h / 2 - saved.centerY * zoom,
+    zoom,
+  };
+}
+

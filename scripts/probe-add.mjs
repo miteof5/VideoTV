@@ -97,10 +97,10 @@ for (const v of VIEWS) {
   await page.goto(`${BASE}/projects/${projectId}`, { waitUntil: "networkidle2" });
   await sleep(1200);
 
-  // 点左上角「+ 文本提示词」
+  // 点左上角「+ 提示词优化」
   await page.evaluate(() => {
     const btn = [...document.querySelectorAll("button")].find((b) =>
-      b.textContent.trim().startsWith("+ 文本提示词")
+      b.textContent.trim().startsWith("+ 提示词优化")
     );
     btn.click();
   });
@@ -141,6 +141,18 @@ for (const v of VIEWS) {
   if (v !== VIEWS[VIEWS.length - 1]) {
     const db = new Database("dev.db");
     db.prepare("delete from Node where projectId = ?").run(projectId);
+    /*
+     * 视野存档也要一起清（2026-10-26 视口持久化之后加的）。
+     *
+     * 这个用例测的是「**从没打开过**的项目 → 加第一个节点 → 定在 34%」。
+     * 一旦项目有了存档，打开时还原存档而不是按当前窗口取景 ——
+     * 这是产品决定（关掉再进来要回到原样），不是缺陷；
+     * 但留着存档就等于换了个前提，测出来的不是上面那个过程：
+     * 实测 1440 窗口下会拿 1080 窗口存的 span 去还原，左右余量 596.9 / 463.5。
+     */
+    db.prepare(
+      "update Project set viewCenterX = null, viewCenterY = null, viewSpan = null where id = ?"
+    ).run(projectId);
     db.close();
   }
   await page.close();
@@ -180,7 +192,7 @@ for (const v of VIEWS) {
 
   await page.evaluate(() => {
     const btn = [...document.querySelectorAll("button")].find((b) =>
-      b.textContent.trim().startsWith("+ 文本提示词")
+      b.textContent.trim().startsWith("+ 提示词优化")
     );
     btn.click();
   });
@@ -218,6 +230,22 @@ for (const v of VIEWS) {
 }
 
 await browser.close();
+
+/*
+ * 跑完把探针项目带走。
+ * 不带走的话它会一直出现在首页项目列表里（人肉眼可见的垃圾），
+ * 直到下一次运行被 `freshProject()` 清掉 —— 那可能是几天之后。
+ */
+{
+  const db = new Database("dev.db");
+  const row = db.prepare("select id from Project where name = ?").get(PROJECT_NAME);
+  if (row) {
+    db.prepare("delete from Edge where projectId = ?").run(row.id);
+    db.prepare("delete from Node where projectId = ?").run(row.id);
+    db.prepare("delete from Project where id = ?").run(row.id);
+  }
+  db.close();
+}
 
 console.log("\n---------------------------------------");
 if (fails.length) {

@@ -20,11 +20,14 @@ import { AssetLibrary, type AssetItem } from "@/canvas/AssetLibrary";
 import { addableTypes, nodeRegistry } from "@/canvas/nodeRegistry";
 import { reactFlowNodeTypes } from "@/canvas/nodeTypes";
 import {
-  findFreeSpot,
   fitViewportFromBoxes,
+  savedFromViewport,
+  viewportFromSaved,
   NODE_WIDTH,
   NODE_HEIGHT,
   type Box,
+  type SavedViewport,
+  type Viewport,
 } from "@/canvas/layout";
 import type { CanvasNode } from "@/canvas/types";
 import type { NodeRuntime } from "@/stores/runStore";
@@ -33,7 +36,7 @@ import type { NodeRuntime } from "@/stores/runStore";
  * 画布上浮着的工具栏（左上「+ 节点」、右上「已保存」）占掉的顶部高度。
  *
  * 它是浮层，不占布局 —— 对 React Flow 来说视口就是整个矩形，
- * 所以首屏 fitView 时内容会一头钻进工具栏底下。
+ * 所以取景时内容会一头钻进工具栏底下。
  * 96 = 工具栏实测高度（按钮 20px 字 + 上下 padding ≈ 56）+ 40 的呼吸空间。
  * 工具栏再改样式时记得回来看这个数。
  */
@@ -71,6 +74,22 @@ const FIRST_VIEW_MAX_H = 0.34;
 const FIRST_VIEW_PADDING = 0.12;
 
 /**
+ * 画布缩放的硬边界，**读存档时也要用同一组数夹一次**。
+ *
+ * 下限 0.15：一张 1280 宽的节点缩到 0.15 还有 192px，认得出是哪张图，
+ * 再小就只剩一个色块（详见下面 minZoom 那段历史）。
+ * 上限 2：React Flow 的默认值，再大只是像素化，看不出更多信息。
+ *
+ * 为什么读存档必须夹：存档里的 span 是「上一个窗口」算出来的。
+ * 窗口从 2560 缩到 900 之后再打开，`画布宽 ÷ span` 可能算出 0.09 ——
+ * 那是 react-flow 不接受的 zoom，写进去会被库自己夹回来，
+ * 但夹的动作发生在 onMove 之后，等于先画一帧错的再纠正。
+ * 自己先夹，第一帧就是对的。
+ */
+const MIN_ZOOM = 0.15;
+const MAX_ZOOM = 2;
+
+/**
  * 连线的粗细，单位是**屏幕像素**（不是画布坐标）。
  *
  * 为什么要单独写一个常量、而不是直接在 CSS 里写 `stroke-width: 1`：
@@ -94,7 +113,23 @@ const FIRST_VIEW_PADDING = 0.12;
  */
 const EDGE_SCREEN_W = 1.5;
 
-function CanvasInner() {
+/**
+ * 两个 viewport 是不是「同一个取景」。
+ *
+ * 容差按**屏幕像素**给：zoom 差 0.001 在 720 高的画布上是 0.7px，
+ * 平移差 0.5 设计像素在 zoom 0.3 时是 0.15 屏幕像素 —— 都看不出来。
+ * 定义在模块顶层是为了身份稳定：写成组件内的箭头函数，
+ * `applyCamera` 每次渲染都会换一个引用，那个 effect 就会每帧重跑一遍。
+ */
+function sameViewport(a: Viewport, b: Viewport): boolean {
+  return (
+    Math.abs(a.zoom - b.zoom) < 0.001 &&
+    Math.abs(a.x - b.x) < 0.5 &&
+    Math.abs(a.y - b.y) < 0.5
+  );
+}
+
+function CanvasInner({ initialViewport }: { initialViewport: SavedViewport | null }) {
   const projectId = useCanvasStore((s) => s.projectId);
   // 订阅运行流。整个画布只有这一处订阅 —— 事件进来后由 runStore 分发，
   // 各个节点按自己的 id 去取，不需要每个节点各开一条 SSE。
@@ -113,11 +148,21 @@ function CanvasInner() {
   const setError = useCanvasStore((s) => s.setError);
 
   const setDragging = useUiStore((s) => s.setDragging);
-  const { screenToFlowPosition, deleteElements, fitView, setViewport } = useReactFlow();
+  const { screenToFlowPosition, deleteElements, fitView, setViewport, getViewport } =
+    useReactFlow();
   const [saving, setSaving] = useState(false);
 
   /**
-   * 首屏把整张图放进视野。
+   * 首屏取景：让**第一个出现的节点**一露面就停在「占画布高 34%」这一档。
+   *
+   * 先纠正一个容易写歪的因果：它服务的时刻**不是「打开项目」**。
+   * 新项目进来是一张空画布，这一刻没有任何东西可取景；真正发生的是
+   * 「用户加了第一个节点」—— 视野就该定在 34% 这个比例上，
+   * 而不是把这张 1024×768 的卡片顶满屏幕。
+   * 34% 是**默认状态本身**，不是「帮用户找到节点在哪」的兜底。
+   *
+   * 多节点时同一个公式按包围盒缩小（见 `Math.min` 三段），
+   * 那是公式的自然结果，不是这段代码的目的。
    *
    * 为什么不用 `<ReactFlow fitView>` 这个 prop：
    * 它会在**第一个节点测量完成**时就执行一次。以前所有节点都是 400×250、
@@ -142,33 +187,39 @@ function CanvasInner() {
    * 与其去猜它的内部算法，不如自己算一次「顶边现在在哪」再补偏移 ——
    * 语义直接，工具栏高度将来变了也只改 FLOATING_UI_H 一个数。
    */
-  const didFitRef = useRef(false);
+  const nodeCount = nodes.length;
 
   /*
-   * 首屏取景只做一次，但**「一次」的判据不能是「effect 跑过没有」**。
+   * 首屏取景 / 还原存档的**介入判据**。
    *
-   * 2026-10-24 人报的 bug：「新建项目 → 点添加节点，默认还是之前的比例（突脸），
-   * 刷新一下就变成 34%」。根因就在这里 ——
+   * 判据不是「这段 effect 跑过没有」，而是「相机现在还是不是出厂状态」
+   * —— 这一条是 2026-10-26 人报的 bug 换来的：
    *
-   * 旧写法是 `if (!nodesInitialized || didFitRef.current) return; didFitRef.current = true;`，
-   * 只要 `nodesInitialized` 在**画布还空着**的时候变 true 过一次，这次「取景机会」
-   * 就被空画布吃掉了（此时 fitView 没有节点可框，等于什么都没做，但锁已经上）。
-   * 之后加节点时节点数 0 → 1，effect 会重跑，可 `didFitRef` 已经是 true，
-   * fitView 再也不执行，viewport 停在 react-flow 的初始 `zoom = 1` ——
-   * 1024×768 的卡片在 1028 高的画布上顶满，看起来就是「之前那个比例」。
-   * 刷新会重新挂载组件、ref 归零，于是又正常。**「刷新就好」是它最典型的指纹。**
+   * 现象：点「← 返回」回首页，再点同一个项目进来，画面变成 zoom=1 的突脸，
+   * 而且之后怎么都不恢复，只有整页刷新（F5）才对。而 F5 恰好是对的，
+   * 所以第一次排查时被「刷新就好」误导成数据没存下来 —— 其实库里三个数好端端的。
    *
-   * 空画布时 `nodesInitialized` 为什么会是 true：react-flow 的判据是
-   * `nodes.length > 0 && 全部 measured`，空数组本该是 false；但 store 残留
-   * （上一个项目的节点还没被 load 覆盖）、Fast Refresh 热替换、StrictMode
-   * 双跑 effect 都会让这个字段出现一次「先 true 后 false」的抖动。
-   * 单靠 ref 挡不住抖动，因为 ref 分不清「空画布」和「有节点的画布」。
+   * 根因：Next 的段缓存会保留组件实例的 hooks 状态（实测同一个实例 id 贯穿两次进入，
+   * 中间只有 effect 卸载/重挂），**但 react-flow 的相机被重置成了默认 `{x:0,y:0,zoom:1}`**。
+   * 于是「跑过就锁死」的 `didFitRef` 还是 true，还原逻辑直接被挡在门外 ——
+   * 锁在，相机没了。
    *
-   * 所以判据改成**画布上有没有出现过节点**：`nodeCount === 0` 直接返回，
-   * **不消耗**这次机会。这样无论上面发生哪种抖动，第一次真正有节点且量完尺寸时
-   * 一定会取一次景，而取过之后 ref 就锁死，不会每加一个节点都跳一下视野。
+   * 更早的 2026-10-24 那次是同一个病根的反面：空画布把「取景机会」吃掉、
+   * 锁提前上死，加节点后停在 zoom=1，**刷新才好**。
+   *
+   * 两次的共同教训：**任何「只做一次」的 ref 锁，都假定「ref 的生命周期 == 相机状态的生命周期」，
+   * 而这个假定在路由缓存 / StrictMode / 热替换下都不成立。**
+   * 所以判据换成可观测的状态：相机是否还停在 `{x:0,y:0,zoom:1}`。
+   *   - 是出厂状态 → 没人动过，该介入（还原存档，或按 34% 取景）
+   *   - 不是出厂状态 → 用户已经自己看过这张图了，**永不再抢**
+   *
+   * 唯一代价：用户恰好手动把画布拖回原点、且 zoom 正好是 1 时，
+   * 会被当成「没动过」再介入一次（跳到存档视野）。凑到这个数值需要刻意为之，接受。
    */
-  const nodeCount = nodes.length;
+  const FACTORY = 1e-6;
+  const isFactoryCamera = (v: { x: number; y: number; zoom: number }) =>
+    Math.abs(v.zoom - 1) < FACTORY && Math.abs(v.x) < 0.5 && Math.abs(v.y) < 0.5;
+
   // 画布容器的引用。新节点要落在「画布可见区域」的中心，
   // 而右侧属性面板占掉 300px，用 window.innerWidth 算出来的中心会偏到面板底下。
   // 首屏取景也要拿它量画布尺寸（算「内容最多占多高」），所以声明必须在使用之前。
@@ -194,6 +245,131 @@ function CanvasInner() {
     // 拖拽中那条跟随鼠标的线也要一起 —— 否则「拖的时候细、松手后变粗」
     el.style.setProperty("--xy-connectionline-stroke-width", w);
   }, []);
+
+  /*
+   * 相机重试的状态。
+   *
+   * `cameraRetry` 存着「还没把相机放到目标位置」的那次重试定时器；
+   * `userMovedRef` 一旦置位就再也不自动改相机了（用户接管）。
+   */
+  const cameraRetry = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const userMovedRef = useRef(false);
+
+  const cancelCameraRetry = useCallback(() => {
+    if (cameraRetry.current) {
+      clearTimeout(cameraRetry.current);
+      cameraRetry.current = null;
+    }
+  }, []);
+
+  /**
+   * 把相机放到目标位置 —— 并且**放到真的生效为止**（有界重试）。
+   *
+   * 为什么不能只调一次 `setViewport`：
+   *
+   * 从首页点项目卡片进来（客户端跳转）时，这段 effect 跑得比 react-flow
+   * 把平移缩放那一层挂上 DOM 更早。那一刻 `setViewport` 是**静默空操作** ——
+   * 不报错、不抛异常、store 里的值纹丝不动（实测调用后立刻读回来还是 `zoom=1`）。
+   * 于是「关掉再进来还是同一个画面」在这条路径上完全失效，也就是人报的
+   * 「点返回再点进来，画面变成突脸」。整页加载（F5）没有这个窗口期，
+   * 所以第一次排查时它看起来是好的 —— 这也是它容易被漏掉的原因。
+   *
+   * 实测迟到一次（50ms）就生效，这里给 20 次 × 50ms = 1s 的余量，
+   * 每次重试前先读一遍当前相机：一旦到位就停，绝不反复推。
+   *
+   * `userMovedRef` 是刹车：重试窗口期内用户要是自己拖了画布，
+   * 立刻放弃，绝不在人手上抢镜头。
+   */
+  const applyCamera = useCallback(
+    (target: Viewport) => {
+      cancelCameraRetry();
+      let tries = 0;
+
+      const attempt = () => {
+        cameraRetry.current = null;
+        if (userMovedRef.current) return;
+
+        if (sameViewport(getViewport(), target)) return; // 已经到位
+        setViewport(target, { duration: 0 });
+
+        /*
+         * 头几次用 16ms（≈一帧）追，因为窗口期通常只有一两帧；
+         * 之后放宽到 80ms，覆盖慢机器上挂载更迟的情况。
+         * 上限 1 秒多一点：再久就不是「晚一拍」而是真出问题了，
+         * 继续推只会跟用户抢镜头。
+         */
+        if (++tries >= 30) return;
+        cameraRetry.current = setTimeout(attempt, tries < 16 ? 16 : 80);
+      };
+
+      attempt();
+    },
+    [cancelCameraRetry, getViewport, setViewport]
+  );
+
+  // 卸载时把重试停掉，避免定时器在组件消失后还在推相机
+  useEffect(() => cancelCameraRetry, [cancelCameraRetry]);
+
+  /*
+   * 视野落库。
+   *
+   * ### 为什么用 `onMoveEnd` 而不是 `onMove`
+   *
+   * `onMove` 缩放时**每一帧**都会进来（线宽那个回调就在那儿）。在这里发请求，
+   * 拖一次画布会打几十个 PUT。`onMoveEnd` 是「一次拖动 / 一次滚轮手势结束」，
+   * 和人对「一次操作」的直觉完全对得上 —— 不需要自己发明一个防抖窗口来猜意图。
+   *
+   * 还是留了 250ms 的防抖：连续滚 5 格滚轮时 d3-zoom 会分几次 end，
+   * 不留一道会把它们当成五次操作。250 是「手势之间的停顿」量级，
+   * 再短挡不住连发，再长会让用户刚松手就关掉页面时丢掉这一次。
+   *
+   * ### 为什么同值不发
+   *
+   * 打开项目时也会走一次（人拍板：自动取景算一次实际操作）。
+   * 但第二次在同一个窗口打开同一个项目，算出来的三个数和库里一模一样 ——
+   * 白发一个请求没有意义。用 1 位小数去重：0.1 设计像素的差别
+   * 在屏幕上量不出来（zoom 0.34 时是 0.034 屏幕像素）。
+   */
+  const viewportSave = useRef<{ timer: ReturnType<typeof setTimeout> | null; lastKey: string }>({
+    timer: null,
+    lastKey: "",
+  });
+
+  const scheduleViewportSave = useCallback(
+    (vp: Viewport) => {
+      const el = canvasRef.current;
+      if (!el || !projectId) return;
+
+      // 用**当前**画布尺寸算存档，不是上次的 —— 否则窗口缩放之后再操作，
+      // 存进去的 span 会是旧窗口的，还原时就偏了。
+      const saved = savedFromViewport(vp, { w: el.clientWidth, h: el.clientHeight });
+      if (!saved) return;
+
+      const key = `${saved.centerX.toFixed(1)}|${saved.centerY.toFixed(1)}|${saved.span.toFixed(1)}`;
+      if (key === viewportSave.current.lastKey) return;
+
+      if (viewportSave.current.timer) clearTimeout(viewportSave.current.timer);
+      viewportSave.current.timer = setTimeout(() => {
+        viewportSave.current.lastKey = key;
+        void fetch(`/api/projects/${projectId}/viewport`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(saved),
+        })
+          .then((res) => {
+            // 失败就把 lastKey 清掉，让下一次操作能重试同一组数。
+            // 不清的话，写失败之后用户再怎么拖（只要回到同一位置）都不会再写。
+            if (!res.ok) viewportSave.current.lastKey = "";
+          })
+          .catch(() => {
+            viewportSave.current.lastKey = "";
+          });
+        // 不弹任何错误提示：视野不是内容。丢了最多回到稍早一点的视角，
+        // 而每拖一下画布弹一条「保存失败」比丢视野烦得多。
+      }, 250);
+    },
+    [projectId]
+  );
 
   /**
    * 把节点转成「已知尺寸的矩形」，供首屏取景算包围盒。
@@ -251,30 +427,85 @@ function CanvasInner() {
    * 我们要做的就是别把取景推迟到测量之后。
    */
   useLayoutEffect(() => {
-    if (didFitRef.current) return;
-    if (nodeCount === 0) return; // 空画布：不算「首屏」，别浪费这次机会（见上面那段）
-    didFitRef.current = true;
+    if (nodeCount === 0) return; // 空画布：没有可框的东西，等节点出现再说
+
+    /*
+     * 相机已经不是出厂状态 = 有人看过这张图了（用户拖过、缩过、点过 fitView，
+     * 或者上一次介入已经把视野放好了）。那就别再动它 —— 这一条同时替代了
+     * 原来那把「只跑一次」的锁，理由见上面 `isFactoryCamera` 那段。
+     */
+    if (!isFactoryCamera(getViewport())) return;
+
+    /*
+     * 相机回到出厂状态 = 这次挂载拿到的是一个全新的相机
+     * （整页加载，或路由缓存把组件留下、把相机重置了）。
+     * 上一轮「用户已经接管」的记忆随之作废 —— 不然后果是：
+     * 用户拖过一次画布 → 回首页 → 再进来，相机明明是出厂状态却因为
+     * 那个残留标记而拒绝还原，又变回突脸。
+     *
+     * 只在没有重试在飞的时候清：重试在飞说明这一轮的介入还没落地，
+     * 此时清掉刹车有可能把「用户刚按下的拖动」也一起清掉。
+     */
+    if (!cameraRetry.current) userMovedRef.current = false;
 
     const el = canvasRef.current;
-    const vp = fitViewportFromBoxes(
-      boxesOf(nodes),
-      {
-        w: el?.clientWidth ?? window.innerWidth,
-        h: el?.clientHeight ?? window.innerHeight,
-      },
-      {
-        maxHeightRatio: FIRST_VIEW_MAX_H,
-        topInset: FLOATING_UI_H,
-        padding: FIRST_VIEW_PADDING,
+    const canvas = {
+      w: el?.clientWidth ?? window.innerWidth,
+      h: el?.clientHeight ?? window.innerHeight,
+    };
+
+    /*
+     * ① 有存档 → 还原，**不再看节点摆在哪**。
+     *
+     * 这是「关掉再进来还是同一个画面」的全部实现。取景从此退化成
+     * 只服务「相机没被人碰过又有节点」这一种情况；一旦项目有过视野，
+     * 构图由人决定，不由节点包围盒决定。
+     *
+     * 包括「存档中心其实是一片空地」这种情况 —— 人明确说不用兜。
+     * 逻辑上也确实不该兜：加节点和拖节点都不改相机，相机凭什么自己动。
+     * 想回到全览，按左下角的 fitView。
+     */
+    if (initialViewport) {
+      const restored = viewportFromSaved(initialViewport, canvas, {
+        minZoom: MIN_ZOOM,
+        maxZoom: MAX_ZOOM,
+      });
+      if (restored) {
+        applyCamera(restored);
+        syncEdgeWidth(restored.zoom);
+        /*
+         * 还原也算一次实际操作（人拍板：打开就定型）。
+         *
+         * 这里主动调一次，不指望 react-flow 的 `onMoveEnd` 被程序化
+         * `setViewport` 触发 —— 那是库的实现细节，升级一版就可能静默失效，
+         * 症状是「老项目再也不写存档」，而且不报错。
+         * （实测 v12 程序化 setViewport 会补发一次 `onMoveEnd`，event 为 null；
+         * 两条路都写同一组数，`scheduleViewportSave` 里按 key 去重，不会重复请求。）
+         */
+        scheduleViewportSave(restored);
+        return;
       }
-    );
+      // 存档不合法（span ≤ 0、坐标不是有限数）就落到下面走自动取景，
+      // 相当于「这条存档坏了，当没有」。
+    }
+
+    // ② 没有存档 → 首屏取景（加第一个节点时定在 34% 那一档）
+    const vp = fitViewportFromBoxes(boxesOf(nodes), canvas, {
+      maxHeightRatio: FIRST_VIEW_MAX_H,
+      topInset: FLOATING_UI_H,
+      padding: FIRST_VIEW_PADDING,
+    });
     if (vp) {
-      setViewport(vp, { duration: 0 });
+      applyCamera(vp);
       // 首屏也要同步一次：onMove 通常会在程序化 setViewport 之后触发，
       // 但不依赖它 —— 早几十毫秒把线画对，总比「先细一下再变粗」好。
       syncEdgeWidth(vp.zoom);
+      // 自动取景也写一次（人拍板）。这条让「打开没动过的老项目」立刻定型。
+      scheduleViewportSave(vp);
     }
-  }, [nodeCount, nodes, setViewport, syncEdgeWidth]);
+    // isFactoryCamera 是每次现算的纯判断，不需要进依赖数组
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeCount, nodes, initialViewport, applyCamera, syncEdgeWidth, scheduleViewportSave]);
 
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -381,15 +612,26 @@ function CanvasInner() {
   }, [uploadOpen]);
 
   /**
-   * 在视野中心加一个节点，压住别人就自动挪开。
+   * 在当前画面中央加一个节点。**不做避让**。
    *
-   * 用 `useCanvasStore.getState().nodes` 而不是闭包里的 nodes，是有原因的：
-   * 连续添加多个节点时（一次上传选了好几个文件），React 还没重渲染，
-   * 闭包里的 nodes 还是旧数组 —— findFreeSpot 每次都算出同一个空位，
-   * 结果几个节点精确叠在一起，看起来像只加了一个。
+   * 2026-10-26 人拍板：新节点永远落在正中央，允许压住已有节点。
+   * 理由有两条 —— 加东西的时候画面不该自己动；新节点在最上层，
+   * 本来就看得出来它是刚加进来的。
+   *
+   * 这条决定废掉了原来的「向右下螺旋找空位」（`findFreeSpot`，24 次尝试）。
+   * 那个算法当初存在的理由是「新节点压住旧节点，用户会以为没加上」——
+   * 现在用另一种方式解决：视野不动，节点就出现在你正看着的地方。
+   *
+   * ### 唯一的例外：同批次
+   *
+   * 一次上传 5 个文件会连着调 5 次。如果每次都用同一个中心点，
+   * 5 个节点会**精确落在同一个坐标**上 —— 视觉上只多出最上面那个，
+   * 另外 4 个完整压在底下，用户会以为只成功了 1 个然后重传一遍。
+   * 所以同批次按索引沿右下对角错开（`batchIndex`），
+   * 单次点击时 batchIndex 恒为 0，永远精确居中。
    */
   const addNodeAtCenter = useCallback(
-    (type: string, overrides?: Record<string, unknown>) => {
+    (type: string, overrides?: Record<string, unknown>, batchIndex = 0) => {
       const rect = canvasRef.current?.getBoundingClientRect();
       const center = screenToFlowPosition({
         x: (rect?.left ?? 0) + (rect?.width ?? window.innerWidth) / 2,
@@ -399,15 +641,24 @@ function CanvasInner() {
       const size = nodeRegistry[type]?.size;
       const w = size?.w ?? NODE_WIDTH;
       const h = size?.h ?? NODE_HEIGHT;
-      const spot = findFreeSpot(
-        useCanvasStore.getState().nodes.map((n) => n.position),
-        // 落在中心偏左上一点：正好压中心的话，节点的右半边会比左半边多一点，
-        // 视觉上会偏。偏移量取半个宽高，节点就精确居中。
-        { x: center.x - w / 2, y: center.y - h / 2 },
-        w,
-        h
+
+      /*
+       * 错开 0.3 个节点宽，纵向按同一比例（h/w）跟着走，保持对角方向。
+       * 0.3 是怎么来的：1280 宽的卡片错开 384 设计像素，
+       * 在 34% 的首屏缩放下屏幕上是 130px —— 认得出是两张，又不散开。
+       * 5 个文件排下来偏 1.2 个卡宽（1536 设计像素），
+       * 首屏一个画布宽能装 5648 设计像素，装得下。
+       */
+      const offset = batchIndex * w * 0.3;
+
+      addNode(
+        type,
+        {
+          x: center.x - w / 2 + offset,
+          y: center.y - h / 2 + offset * (h / w),
+        },
+        overrides
       );
-      addNode(type, spot, overrides);
     },
     [screenToFlowPosition, addNode]
   );
@@ -459,6 +710,10 @@ function CanvasInner() {
 
     const files = Array.from(list);
     const failed: string[] = [];
+    // 同批次内的序号：第 1 个精确居中，第 2 个起沿右下错开（见 addNodeAtCenter）。
+    // 只数**成功**的 —— 失败的文件没有节点，不该占一个位，否则画布上会出现
+    // 一段没有节点的空档，用户会以为那里有个看不见的东西。
+    let batchIndex = 0;
 
     setUploading(true);
     try {
@@ -490,7 +745,7 @@ function CanvasInner() {
             assetSize: body.sizeBytes,
             assetName: body.name,
             status: NODE_STATUS.SUCCEEDED,
-          });
+          }, batchIndex++);
         } catch (err) {
           failed.push(
             `${file.name}：${err instanceof Error ? err.message : "上传失败"}`
@@ -525,13 +780,29 @@ function CanvasInner() {
          * 所以回调里只改 CSS 变量、不碰 state。
          */
         onMove={(_, v) => syncEdgeWidth(v.zoom)}
+        // 一次平移 / 缩放**结束**时落库视野（防抖 + 去重都在 scheduleViewportSave 里）。
+        // 不挂在 onMove 上：那是每一帧。
+        onMoveEnd={(_e, v) => scheduleViewportSave(v)}
         // 拖动期间记下是谁在动，卡片据此收起浮出的面板。
         // 松手必须清掉：不然下一次选中任何节点，它的面板都不会出现。
+        /*
+         * 用户接管相机的信号。
+         *
+         * 实测 react-flow v12：程序化 `setViewport` 也会触发本回调，
+         * 但 event 是 null；真实手势（拖拽 / 滚轮）event 是有值的。
+         * 所以「event 非空」= 人在动相机 —— 从此不再自动改视野，
+         * 正在重试的 `applyCamera` 也立刻刹车。
+         */
+        onMoveStart={(e) => {
+          if (!e) return;
+          userMovedRef.current = true;
+          cancelCameraRetry();
+        }}
         onNodeDragStart={(_, node) => setDragging(node.id)}
         onNodeDragStop={() => setDragging(null)}
         // 双击断开连接的是上面的原生捕获监听，不在这里 —— 见那段注释
         nodeTypes={reactFlowNodeTypes}
-        // 不用 fitView prop：它只对着第一个量完的节点对齐（见上面 didFitRef 的注释），
+        // 不用 fitView prop：它只对着第一个量完的节点对齐（见上面 `isFactoryCamera` 那段），
         // 而且它发生在 paint 之后，会先画出「默认 zoom=1」那一帧。
         // 首屏对齐改由上面那个 useLayoutEffect 负责（用登记尺寸算，不等测量）。
         // 手动 fitView 也没了：它内部还要再等一帧，同样会露馅。
@@ -551,7 +822,10 @@ function CanvasInner() {
          * 一张占位 1280 宽的节点缩到 0.15 还有 192px，认得出是哪张图，
          * 再小就只剩一个色块了。上限仍然由 fitView 的 maxZoom: 1 兜着。
          */
-        minZoom={0.15}
+        minZoom={MIN_ZOOM}
+        // 显式给上限，不依赖 React Flow 的默认值 —— 读存档时的夹取（viewportFromSaved）
+        // 用的是同一个常量，两边必须一致，否则存档能算出库不接受的 zoom。
+        maxZoom={MAX_ZOOM}
         className="bg-[color:var(--surface-0)]"
       >
         {/* 网格线要**暗**：浅灰 #e5e5e5 在近黑底上会变成一张刺眼的白网。
@@ -763,6 +1037,15 @@ export interface CanvasProps {
    * 明明刚才生成好的图和视频还在库里，用户却看不见。
    */
   initialRuntime: Record<string, NodeRuntime>;
+  /**
+   * 上次离开时的视野。null = 这个项目从没存过视野，走首屏自动取景。
+   *
+   * 由服务端从 Project 表三列读出来，和节点数据同一次查询 ——
+   * 这一点很关键：视野必须在节点出现的那一帧就位，否则会先按 fitView
+   * 画一帧再跳过去（就是首屏取景那段注释里讲的「突脸帧」）。
+   * 存在 localStorage 里做不到这件事，它是异步读的。
+   */
+  initialViewport: SavedViewport | null;
 }
 
 export function Canvas({
@@ -770,6 +1053,7 @@ export function Canvas({
   initialNodes,
   initialEdges,
   initialRuntime,
+  initialViewport,
 }: CanvasProps) {
   const init = useCanvasStore((s) => s.init);
   const hydrate = useRunStore((s) => s.hydrate);
@@ -787,7 +1071,7 @@ export function Canvas({
 
   return (
     <ReactFlowProvider>
-      <CanvasInner />
+      <CanvasInner initialViewport={initialViewport} />
     </ReactFlowProvider>
   );
 }

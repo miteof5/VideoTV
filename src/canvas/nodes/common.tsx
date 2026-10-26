@@ -153,7 +153,7 @@ export function NodeDeleteButton({ nodeId }: { nodeId: string }) {
       title="删除节点"
       data-action="delete"
       onClick={() => deleteElements({ nodes: [{ id: nodeId }] })}
-      className="nodrag nopan absolute -right-16 -top-7 z-10 flex h-16 w-16 items-center justify-center rounded-full border-2 border-[color:var(--line-2)] bg-[color:var(--surface-1)] text-[length:var(--fs-bare-hint)] leading-none text-[color:var(--ink-3)] shadow-[0_4px_20px_rgba(0,0,0,0.5)] transition-colors hover:border-red-800 hover:text-red-400"
+      className="nodrag nopan absolute -right-16 -top-7 z-10 flex h-16 w-16 items-center justify-center rounded-full border-[3px] border-[color:var(--line-2)] bg-[color:var(--surface-1)] text-[length:var(--fs-bare-hint)] leading-none text-[color:var(--ink-3)] shadow-[0_4px_20px_rgba(0,0,0,0.5)] transition-colors hover:border-red-800 hover:text-red-400"
     >
       ×
     </button>

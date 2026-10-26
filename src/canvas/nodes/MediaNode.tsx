@@ -196,7 +196,7 @@ export function MediaNode({
       <div
         data-node-label="1"
         className={[
-          "absolute bottom-full left-0 mb-1.5 flex max-w-full items-center gap-3 whitespace-nowrap text-[length:var(--fs-bare-label)] leading-none transition-opacity",
+          "absolute bottom-full left-0 mb-3 flex max-w-full items-center gap-4 whitespace-nowrap text-[length:var(--fs-bare-label)] leading-none transition-opacity",
           /*
            * 只输出一个 opacity 类。
            * 写成 `selected ? "opacity-100" : "..."` 再拼一个 `dragging ? "opacity-0"`，
@@ -210,7 +210,7 @@ export function MediaNode({
               : "opacity-0 group-hover:opacity-100",
         ].join(" ")}
       >
-        <span className={`h-4 w-4 shrink-0 rounded-full ${status.dot}`} />
+        <span className={`h-8 w-8 shrink-0 rounded-full ${status.dot}`} />
         {editingLabel ? (
           <div className="w-[340px]">
             <TextField
@@ -263,12 +263,12 @@ export function MediaNode({
       {/* 产物本体。圆角只在这一层，边框/背景一概没有 */}
       <div
         className={[
-          "relative h-full w-full overflow-hidden rounded-xl bg-[color:var(--surface-2)] transition-shadow",
+          "relative h-full w-full overflow-hidden rounded-3xl bg-[color:var(--surface-2)] transition-shadow",
           selected
             // 选中/悬停的高亮圈：原来是深色（黑圈压在白底上），
             // 暗色下必须反过来用白色半透明，否则压在图上完全看不见
-            ? "ring-2 ring-white/45"
-            : "group-hover:ring-1 group-hover:ring-white/20",
+            ? "ring-[4px] ring-white/45"
+            : "group-hover:ring-2 group-hover:ring-white/20",
         ].join(" ")}
       >
         {previewAsset?.kind === "video" ? (
@@ -349,7 +349,7 @@ export function MediaNode({
           <span
             data-demo-badge="1"
             title="当前用的是内置演示模型，产出是占位内容，不是真实模型生成的结果"
-            className="pointer-events-none absolute left-2.5 top-2.5 z-10 rounded bg-amber-100/95 px-2 py-1 text-[length:var(--fs-meta)] font-medium leading-none text-amber-700"
+            className="pointer-events-none absolute left-6 top-6 z-10 rounded-lg bg-amber-950/90 px-3 py-1.5 text-[length:var(--fs-meta)] font-medium leading-none text-amber-300"
           >
             演示
           </span>
@@ -414,7 +414,7 @@ export function MediaNode({
                * 位置从 -top-12 改 -top-20 不是拍脑袋：原来按钮底边离节点顶边
                * 16px（-48 + 32 = -16），要保住这个间隙，64 高的按钮就得放 -80。
                */
-              className="nodrag nopan absolute -top-20 left-1/2 z-10 flex h-16 -translate-x-1/2 items-center gap-2 whitespace-nowrap rounded-full border-2 border-[color:var(--line-2)] bg-[color:var(--surface-1)] px-6 text-[length:var(--fs-bare-hint)] font-medium text-[color:var(--ink-1)] shadow-[0_4px_20px_rgba(0,0,0,0.5)] transition-colors hover:border-[color:var(--line-3)]"
+              className="nodrag nopan absolute -top-20 left-1/2 z-10 flex h-16 -translate-x-1/2 items-center gap-2 whitespace-nowrap rounded-full border-[3px] border-[color:var(--line-2)] bg-[color:var(--surface-1)] px-6 text-[length:var(--fs-bare-hint)] font-medium text-[color:var(--ink-1)] shadow-[0_4px_20px_rgba(0,0,0,0.5)] transition-colors hover:border-[color:var(--line-3)]"
             >
               ↓ 下载
             </a>

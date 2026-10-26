@@ -1,0 +1,183 @@
+// VideoTV 数据模型
+// 设计基准见 ARCHITECTURE.md 第三节
+// SQLite 不支持 enum，所有枚举字段用 String + 常量约束（见 src/lib/constants.ts）
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Prisma 7 起 url 不再写在这里，改由根目录 prisma.config.ts 提供（供 CLI 迁移使用）
+datasource db {
+  provider = "sqlite"
+}
+
+// 一个项目 = 一部片子 = 一块画布
+model Project {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  nodes  Node[]
+  edges  Edge[]
+  runs   Run[]
+  assets Asset[]
+}
+
+// 画布上的一个节点。type 决定它是什么，data(JSON) 存它自己的配置
+model Node {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  type      String // text.prompt | image.gen | video.gen ...（见 nodeRegistry）
+  positionX Float  @default(0)
+  positionY Float  @default(0)
+  data      String @default("{}") // JSON 字符串，读写时用 zod 校验
+
+  // 运行时状态，每次 run 会重置
+  status        String  @default("idle") // idle|queued|running|succeeded|failed
+  error         String?
+  outputAssetId String?
+  // 产物删了就把引用置空，而不是拦住删除。
+  // 用户从资产库里删掉一个产物时，画布上那个节点会退回「没产物」，
+  // 这是能看懂的失败；报一个外键错误则是看不懂的。
+  outputAsset   Asset?  @relation(fields: [outputAssetId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+}
+
+// 节点之间的依赖边。独立成表是为了拓扑排序能一次查询拿到全图
+model Edge {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  source    String // 上游 node id
+  target    String // 下游 node id
+
+  /**
+   * 连到下游的哪个输入端口：""（默认）| image | endImage
+   *
+   * 为什么不用可空列：SQLite 里 NULL 互不相等，`@@unique` 对 NULL 不生效，
+   * 于是同一条边可以被插进去两次。用空字符串当默认值，唯一约束才真的管用。
+   *
+   * 为什么端口要落库：首帧/尾帧是两条不同的依赖，只存 source/target 的话，
+   * 「这张图是首帧还是尾帧」这个信息就丢了，执行时只能靠猜。
+   */
+  targetHandle String @default("")
+
+  @@unique([source, target, targetHandle])
+  @@index([projectId])
+}
+
+// 生成产物。二进制存在 ./storage，数据库只存元数据
+// 一个资产 = storage 里的一个文件 + 一条元数据。
+// 图片、视频、生成产物、上传的素材，都是 Asset —— 只有一份读写路径。
+model Asset {
+  id        String   @id @default(cuid())
+
+  /*
+   * 归属项目。**可为空**，空 = 未归属。
+   *
+   * 2026-10-26 加这个字段是为了「每个项目一个资产库」。
+   * 之前 Asset 是全局的，于是有了一个看不见的漏：删项目只级联 Node/Edge/Run，
+   * Asset 和它的文件留在原地 —— 库里 272 条记录、55MB，只有 2 条还被节点引用。
+   *
+   * 为什么允许为空而不是必填：存量资产里的归属是**猜**出来的
+   * （只能按「哪个节点引用它」反推），猜不到就只能空着。
+   * 空着 = 不出现在任何项目的资产库里，但不删文件 ——
+   * 宁可留下看不懂的孤儿，也不静默删掉可能是用户手动测试产物的东西。
+   */
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  kind      String // image | video | audio
+  mimeType  String
+  filePath  String // 相对 ./storage 的路径
+  sizeBytes Int     @default(0)
+  createdAt DateTime @default(now())
+
+  nodes Node[]
+
+  @@index([projectId])
+}
+
+// 一次运行。Run 与 Job 分离，是为了支持部分重跑和断点续跑
+model Run {
+  id        String    @id @default(cuid())
+  projectId String
+  project   Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  status    String    @default("pending") // pending|running|succeeded|failed|cancelled
+  startedAt DateTime?
+  endedAt   DateTime?
+  createdAt DateTime  @default(now())
+
+  jobs   Job[]
+  events RunEvent[]
+
+  @@index([projectId])
+}
+
+// 一个节点的一次执行。batch 冗余存批次号，前端渲染进度不必重算拓扑
+model Job {
+  id        String   @id @default(cuid())
+  runId     String
+  run       Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  nodeId    String
+  batch     Int      @default(0)
+  /**
+   * 节点动作的 id（如 optimize / storyboard）。null = 常规生成。
+   *
+   * 为什么动作要存进 Job 而不是节点参数：
+   * 「润色一下这段文案」是一次**执行**，不是节点的持久属性。
+   * 存成参数的话，下次常规运行时它还会带着这个动作，用户会莫名其妙
+   * 每次运行都被改写一遍。
+   */
+  action    String?
+  status    String   @default("pending")
+  attempts  Int      @default(0)
+  lastError String?
+
+  // ---- 抢占与回收 ----
+  // lockedBy：抢到这个 job 的 worker 实例 id
+  // lockedAt：抢占时间，同时被心跳定期刷新，所以它也是「最后一次还活着」的时间。
+  //
+  // 为什么需要它：Worker 被 kill（部署、OOM、Ctrl+C）时，正在跑的 job 会永远
+  // 停在 running —— 没有进程会再去动它，用户只能看到「一直在转」。
+  // 有了心跳时间，别的 worker 就能识别出「超期未心跳」并把它捡回来重跑。
+  lockedBy  String?
+  lockedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([runId, status])
+  @@index([status, lockedAt])
+}
+
+// 运行事件流。
+//
+// 为什么需要一张表，而不是在内存里放一个 EventEmitter：
+// Worker 是**独立进程**，和 Next.js 的 Route Handler 不共享内存。
+// 内存事件总线只能在同一进程内广播，跨进程就断了 —— 这是 SSE 最容易踩的坑。
+//
+// 用表当队列，顺便白拿三个能力：
+//   1. 自增 seq 天然有序，SSE 只要记住「上次读到哪」就能增量推送
+//   2. 断线重连时浏览器会带上 Last-Event-ID，可以精确补发遗漏的事件
+//   3. 刷新页面后能回放整条历史，新开的标签页不会是一片空白
+//
+// 代价是轮询（1s 一次）。单机规模下这点开销可以忽略；
+// 真到需要分布式时换成 Redis Pub/Sub 或 Postgres LISTEN/NOTIFY，接口不用改。
+model RunEvent {
+  seq       Int      @id @default(autoincrement())
+  runId     String
+  run       Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+  type      String   // node.status | node.progress | run.status | log
+  payload   String   // JSON 字符串
+  createdAt DateTime @default(now())
+
+  @@index([runId, seq])
+}

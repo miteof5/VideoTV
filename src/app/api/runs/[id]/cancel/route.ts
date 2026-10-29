@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { guard, ownedRun } from "@/lib/authz";
 import { cancelRun } from "@/lib/runService";
 
 // 取消运行。
@@ -16,6 +17,16 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+
+  // 校验必须在 cancelRun 之前：别人拿你的 runId 一按，你的生成就停了。
+  // 「能取消别人的任务」比「能看别人的任务」更直接地造成损失（钱已经花出去了）。
+  const g = await guard();
+  if (g.error) return g.error;
+  const run = await ownedRun(id, g.user.id);
+  if (!run) {
+    return NextResponse.json({ error: "运行不存在" }, { status: 404 });
+  }
+
   await cancelRun(id);
   return NextResponse.json({ ok: true });
 }

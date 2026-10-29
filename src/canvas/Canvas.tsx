@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -8,6 +15,7 @@ import {
   Controls,
   MiniMap,
   useReactFlow,
+  useStoreApi,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -17,6 +25,7 @@ import { NODE_STATUS, NODE_TYPE } from "@/lib/constants";
 import { useRunStream } from "@/hooks/useRunStream";
 import { RunStatus } from "@/canvas/RunStatus";
 import { AssetLibrary, type AssetItem } from "@/canvas/AssetLibrary";
+import { RunHistory } from "@/canvas/RunHistory";
 import { addableTypes, nodeRegistry } from "@/canvas/nodeRegistry";
 import { reactFlowNodeTypes } from "@/canvas/nodeTypes";
 import {
@@ -127,6 +136,31 @@ function sameViewport(a: Viewport, b: Viewport): boolean {
     Math.abs(a.x - b.x) < 0.5 &&
     Math.abs(a.y - b.y) < 0.5
   );
+}
+
+/**
+ * 上一次量到的画布矩形，连同**量的时候**的窗口尺寸。
+ *
+ * 为什么要缓存：客户端跳转重新挂载时，ref 还没挂上 DOM（实测 render 阶段
+ * `canvasRef.current` 是 null），但 react-flow 的第一帧就在这次 render 里定下来。
+ * 而「画布 = 窗口 − 固定外框」，外框（header 高度）不会因为切页面而变，
+ * 所以用差值就能把画布尺寸还原出来，窗口在这期间被改过大小也算得准。
+ *
+ * 只在这一处更新，读到的地方只有 `estimatedCanvasBox`。
+ */
+let lastCanvasBox: { w: number; h: number; winW: number; winH: number } | null = null;
+
+function rememberCanvasBox(w: number, h: number) {
+  if (w > 0 && h > 0) {
+    lastCanvasBox = { w, h, winW: window.innerWidth, winH: window.innerHeight };
+  }
+}
+
+function estimatedCanvasBox(): { w: number; h: number } | null {
+  if (!lastCanvasBox) return null;
+  const w = lastCanvasBox.w + (window.innerWidth - lastCanvasBox.winW);
+  const h = lastCanvasBox.h + (window.innerHeight - lastCanvasBox.winH);
+  return w > 0 && h > 0 ? { w, h } : null;
 }
 
 function CanvasInner({ initialViewport }: { initialViewport: SavedViewport | null }) {
@@ -244,6 +278,100 @@ function CanvasInner({ initialViewport }: { initialViewport: SavedViewport | nul
     el.style.setProperty("--xy-edge-stroke-width", w);
     // 拖拽中那条跟随鼠标的线也要一起 —— 否则「拖的时候细、松手后变粗」
     el.style.setProperty("--xy-connectionline-stroke-width", w);
+  }, []);
+
+  /*
+   * 首帧相机：让第一次 paint 就是「对的画面」。
+   *
+   * ### 这一次修的是什么
+   *
+   * 点「← 返回」再点同一个项目进来（客户端跳转），实测逐帧记录（1600×1000，
+   * 存档 zoom=0.1827）：
+   *
+   *   dt= 75ms   zoom=1.0000   节点 2 个可见，首节点屏幕宽 1024   ← 突脸
+   *   dt= 84ms   zoom=0.1827   首节点屏幕宽 187                   ← 已缩回
+   *
+   * 也就是**只有一帧**画错，之后被 `applyCamera` 的重试推回去了。
+   * 那一帧能被人看见，要两个条件同时成立：
+   *
+   *   ① 挂载时 react-flow 的 store 被重置成 `transform = [0,0,1]`；
+   *   ② canvasStore 里还留着上一次的节点（带 `measured`）→ react-flow 认为量过了，
+   *      第一帧就画出来，于是满尺寸地铺在 zoom=1 的画布上。
+   *
+   * （整页加载 F5 时 ② 不成立：store 是空的 / 节点还没量过，那一帧什么都没有，
+   * 所以 F5 一直是好的 —— 这就是「刷新就好」的来历。）
+   *
+   * ### 两条腿，各管一段（少一条都不行）
+   *
+   * react-flow 的 `Viewport` 组件用**挂载时读到的 store transform** 当第一帧的
+   * style，`defaultViewport` 又只在 ZoomPane 的 `useEffect`（paint 之后）里生效。
+   * 单独用任一条都不够，实测各有一个后果：
+   *
+   *   - 只写 store、不传 `defaultViewport` → d3 初始化把它打回 `[0,0,1]`，
+   *     相机**永久停在 1.0**（比原来的 bug 更糟，反向验证红 4 条）；
+   *   - 只传 `defaultViewport` → 正确性依赖「passive effect 抢在 paint 之前」，
+   *     7 次里会红 1 次（帧间跳 993px）。
+   *
+   * 所以：render 阶段算出目标交给 `defaultViewport`（管 d3 别回退），
+   * layout effect 里把同一个值写进 store（管第一帧 paint 之前就位）。
+   * 写 store 不能放 render —— 会报 `Cannot update a component while rendering`。
+   *
+   * ### 为什么能在这里算出画布尺寸
+   *
+   * 缓存了「上次量到的画布矩形 + 当时的窗口尺寸」（见 `lastCanvasBox`），
+   * 用差值还原。拿不到缓存（本次会话第一次加载）就不猜，交给原来的自动取景 ——
+   * 那种情况节点还没量过，本来也不会画出那一帧。
+   */
+  const rfStore = useStoreApi();
+  const firstCam = (() => {
+    // 相机不是出厂状态 = 这个相机还活着（同段路由直接换项目时不会重置）。
+    // 这时候不能写 store：d3 里存着另一份 transform，写 store 只会让两边不同步，
+    // 下一次滚轮会跳。这种情况本轮的修法不管，留给上一层的还原逻辑。
+    const [tx, ty, tz] = rfStore.getState().transform;
+    if (!isFactoryCamera({ x: tx, y: ty, zoom: tz })) return null;
+    if (!initialViewport) return null;
+
+    const box = estimatedCanvasBox();
+    if (!box) return null;
+
+    const cam = viewportFromSaved(initialViewport, box, {
+      minZoom: MIN_ZOOM,
+      maxZoom: MAX_ZOOM,
+    });
+    if (!cam) return null;
+
+    return cam;
+  })();
+
+  /*
+   * 真正把它写进相机：layout effect 里，赶在 paint 之前。
+   *
+   * 为什么不直接在上面那个 IIFE 里写 store：React 会报
+   * 「Cannot update a component while rendering a different component」
+   * —— 写 store 会同步通知订阅者，而订阅者里有 React 组件（实测会报 error）。
+   * 挪进 layout effect 就没有这个问题，而且依然在 paint 之前。
+   *
+   * 为什么这里要用**实测**的画布尺寸再算一遍：上面给 `defaultViewport` 的值
+   * 只能是缓存的估算（render 阶段 ref 还没挂上）。估算公式对「窗口变没变」是准的，
+   * 但对「外框高度变没变」不设防 —— 所以真正落地的那一下用 clientWidth/Height，
+   * 顺便把缓存刷新成最新。
+   */
+  useLayoutEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    rememberCanvasBox(el.clientWidth, el.clientHeight);
+    if (!firstCam || !initialViewport) return;
+
+    const cam = viewportFromSaved(
+      initialViewport,
+      { w: el.clientWidth, h: el.clientHeight },
+      { minZoom: MIN_ZOOM, maxZoom: MAX_ZOOM }
+    );
+    if (cam) rfStore.setState({ transform: [cam.x, cam.y, cam.zoom] });
+    // 种子相机的线宽也要在第一帧就对上，不等 onMove
+    syncEdgeWidth(cam?.zoom ?? firstCam.zoom);
+    // 只在挂载时做一次：之后相机归用户、归 applyCamera 的重试
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /*
@@ -510,12 +638,28 @@ function CanvasInner({ initialViewport }: { initialViewport: SavedViewport | nul
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [assetsOpen, setAssetsOpen] = useState(false);
+  const [runsOpen, setRunsOpen] = useState(false);
+
+  /**
+   * 节点 id → 名字。运行历史用它把事件里的 nodeId 说成人话。
+   *
+   * 用 useMemo 而不是每次渲染重建：画布拖拽时这里每秒重渲染几十次，
+   * 新对象会让运行历史跟着重渲染（虽然它只是被传了个 prop）。
+   */
+  const labelOf = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const n of nodes) m[n.id] = String(n.data.label ?? "");
+    return m;
+  }, [nodes]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // canvasRef 已在首屏取景那段之前声明（取景要用它量画布高度）
 
   const save = useCallback(async () => {
     const s = useCanvasStore.getState();
     if (!s.projectId) return;
+
+    // 运行态（产物、状态）在另一个 store 里，保存时要一起读
+    const runtime = useRunStore.getState().runtime;
 
     // 记下本次保存对应的版本。请求飞在路上时用户可能又改了东西，
     // 那种情况下不能把 dirty 清掉（详见 canvasStore 里 revision 的注释）。
@@ -527,13 +671,25 @@ function CanvasInner({ initialViewport }: { initialViewport: SavedViewport | nul
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          nodes: s.nodes.map((n) => ({
-            id: n.id,
-            type: n.type ?? "",
-            positionX: Math.round(n.position.x),
-            positionY: Math.round(n.position.y),
-            data: n.data,
-          })),
+          nodes: s.nodes.map((n) => {
+            /*
+             * 产物引用跟着一起发。
+             *
+             * 服务端只在「这一行要新建」时采用它（撤销把删掉的节点放回来），
+             * 已有行永远由 Worker 写这两列 —— 保存画布不该改变运行结果。
+             * 但撤销之后那一行确实已经没了，不带这个就只剩一个空节点。
+             */
+            const rt = runtime[n.id];
+            return {
+              id: n.id,
+              type: n.type ?? "",
+              positionX: Math.round(n.position.x),
+              positionY: Math.round(n.position.y),
+              data: n.data,
+              outputAssetId: rt?.output?.assetId ?? null,
+              status: rt?.status ?? (typeof n.data.status === "string" ? n.data.status : null),
+            };
+          }),
           edges: s.edges.map((e) => ({
             id: e.id,
             source: e.source,
@@ -592,6 +748,43 @@ function CanvasInner({ initialViewport }: { initialViewport: SavedViewport | nul
     el.addEventListener("dblclick", onDoubleClick, true);
     return () => el.removeEventListener("dblclick", onDoubleClick, true);
   }, [deleteElements]);
+
+  /**
+   * Ctrl+Z 撤销 / Ctrl+Shift+Z（或 Ctrl+Y）重做。
+   *
+   * ### 为什么输入框里要让给浏览器
+   *
+   * 在输入框里按 Ctrl+Z，用户的意图是「撤回我刚打的字」。抢过来的话，
+   * 改一段提示词想撤回打字，结果撤掉的是画布上的一个节点 ——
+   * 而且这个误操作本身还能再被撤销一次，因果彻底乱了。
+   *
+   * ### 为什么挂在 window 上而不是画布容器
+   *
+   * 删除节点之后焦点常常落在 body 上（被删掉的那个按钮已经不在 DOM 里），
+   * 挂在容器上的话那次 Ctrl+Z 会落空 —— 而「删完马上按撤销」正是最需要它的时刻。
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const key = e.key.toLowerCase();
+      if (key !== "z" && key !== "y") return;
+
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)
+      ) {
+        return;
+      }
+
+      e.preventDefault();
+      const store = useCanvasStore.getState();
+      if (key === "y" || e.shiftKey) store.redo();
+      else store.undo();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // 错误提示 3 秒后自动消失
   useEffect(() => {
@@ -772,6 +965,7 @@ function CanvasInner({ initialViewport }: { initialViewport: SavedViewport | nul
       <ReactFlow
         nodes={nodes}
         edges={edges}
+        defaultViewport={firstCam ?? undefined}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
@@ -890,6 +1084,19 @@ function CanvasInner({ initialViewport }: { initialViewport: SavedViewport | nul
         onAddToCanvas={handleAddFromLibrary}
       />
 
+      {/*
+        运行历史。和资产库同一个位置、同一种手感 —— 两者都是「翻已经发生的事」。
+        同时只会开一个：两个抽屉叠在右边互相盖住，看起来像坏了。
+        打开才挂载：内部状态（展开了哪一条、拉过的明细）随卸载复位。
+      */}
+      {runsOpen && (
+        <RunHistory
+          projectId={projectId}
+          onClose={() => setRunsOpen(false)}
+          labelOf={labelOf}
+        />
+      )}
+
       <div className="absolute left-4 top-4 z-10 flex items-center gap-1.5 rounded-lg border border-[color:var(--line-1)] bg-[color:var(--surface-glass)] p-1.5 shadow-sm backdrop-blur">
         {addableTypes.map((def) => (
           <button
@@ -917,7 +1124,10 @@ function CanvasInner({ initialViewport }: { initialViewport: SavedViewport | nul
           type="button"
           data-action="open-assets"
           data-open={assetsOpen ? "1" : "0"}
-          onClick={() => setAssetsOpen((v) => !v)}
+          onClick={() => {
+            setRunsOpen(false);
+            setAssetsOpen((v) => !v);
+          }}
           title="这个项目里出现过的所有图片和视频"
           className={[
             "rounded-md px-2.5 py-1.5 text-[length:var(--fs-meta)] font-medium transition-colors",
@@ -927,6 +1137,24 @@ function CanvasInner({ initialViewport }: { initialViewport: SavedViewport | nul
           ].join(" ")}
         >
           资产库
+        </button>
+        <button
+          type="button"
+          data-action="open-runs"
+          data-open={runsOpen ? "1" : "0"}
+          onClick={() => {
+            setAssetsOpen(false);
+            setRunsOpen((v) => !v);
+          }}
+          title="这个项目跑过的每一次：状态、花了多少、失败在哪"
+          className={[
+            "rounded-md px-2.5 py-1.5 text-[length:var(--fs-meta)] font-medium transition-colors",
+            runsOpen
+              ? "bg-[color:var(--surface-3)] text-[color:var(--ink-1)]"
+              : "text-[color:var(--ink-2)] hover:bg-[color:var(--surface-3)] hover:text-[color:var(--ink-1)]",
+          ].join(" ")}
+        >
+          运行历史
         </button>
       </div>
 

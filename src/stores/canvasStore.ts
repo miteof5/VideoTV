@@ -21,6 +21,12 @@ import { wouldCreateCycle } from "@/engine/cycleDetect";
 // 2. store 可以在组件外读写（getState/setState），保存逻辑不必塞进 React 生命周期。
 // 3. 它天然把「内存态」和「持久态」分开了 —— 内存高频更新，落库低频防抖。
 
+/** 画布的一个历史切片。只含结构与位置，不含运行态 */
+export interface CanvasSnapshot {
+  nodes: CanvasNode[];
+  edges: Edge[];
+}
+
 interface CanvasState {
   projectId: string;
   nodes: CanvasNode[];
@@ -38,8 +44,14 @@ interface CanvasState {
    */
   revision: number;
   lastError: string | null;
+  /** 撤销栈：每次结构性改动前压一份。栈顶是「上一次改动之前」 */
+  past: CanvasSnapshot[];
+  /** 重做栈：撤销时把当前状态挪过来 */
+  future: CanvasSnapshot[];
 
   init: (projectId: string, nodes: CanvasNode[], edges: Edge[]) => void;
+  undo: () => void;
+  redo: () => void;
   onNodesChange: (changes: NodeChange<CanvasNode>[]) => void;
   onEdgesChange: (changes: EdgeChange[]) => void;
   onConnect: (connection: Connection) => void;
@@ -98,6 +110,55 @@ function nextNodeId() {
   return `n_${Date.now().toString(36)}${(seq++).toString(36)}`;
 }
 
+/** 撤销步数上限。50 步足够覆盖「手滑连删」这类操作，再深只是占内存 */
+const HISTORY_LIMIT = 50;
+
+/**
+ * 同一瞬间发生的多次 store 改动，只记一个撤销点。
+ *
+ * 为什么需要：删一个节点会同时触发 onNodesChange(remove) 和
+ * onEdgesChange(remove)（React Flow 会把挂在它身上的边一起删掉）。
+ * 两处各记一次的话，撤销一次只会回到「节点没了、边还在」那个中间态 ——
+ * 用户按一下 Ctrl+Z 发现画面更乱了。
+ *
+ * 80ms 是「同一次用户动作」的合理上界：手再快，两次独立操作也隔着几百毫秒。
+ */
+const SNAPSHOT_COALESCE_MS = 80;
+let lastSnapshotAt = 0;
+
+/**
+ * 上一次「参数编辑」的键与时间。
+ *
+ * 连续打字会每 400ms 提交一次（useDebouncedCommit），如果每次都记一个撤销点，
+ * 撤一次只退掉一个词。同一个字段 1 秒内的连续编辑合成一步。
+ */
+let lastEdit: { key: string; at: number } | null = null;
+
+/** 一次拖拽只记一个撤销点：按下时记，拖动过程中的几十次 position 变更不记 */
+let draggingSnapshotted = false;
+
+type GetState = () => CanvasState;
+type SetState = (partial: Partial<CanvasState>) => void;
+
+/**
+ * 记一份「改动前」的画布。
+ *
+ * 存的是数组引用而不是深拷贝：store 里所有改动都是不可变写法
+ * （applyNodeChanges / map 出新对象），旧数组不会被就地修改，
+ * 所以引用就等价于快照，而且零拷贝成本。
+ */
+function remember(get: GetState, set: SetState) {
+  const now = Date.now();
+  if (now - lastSnapshotAt < SNAPSHOT_COALESCE_MS) return;
+  lastSnapshotAt = now;
+  lastEdit = null;
+
+  const { past, nodes, edges } = get();
+  const next = past.concat({ nodes, edges });
+  if (next.length > HISTORY_LIMIT) next.shift();
+  set({ past: next, future: [] });
+}
+
 export const useCanvasStore = create<CanvasState>((set, get) => ({
   projectId: "",
   nodes: [],
@@ -105,8 +166,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   dirty: false,
   revision: 0,
   lastError: null,
+  past: [],
+  future: [],
 
-  init: (projectId, nodes, edges) =>
+  init: (projectId, nodes, edges) => {
+    // 换项目就清空历史：跨项目的撤销点没有意义，点一次会「撤」出另一个项目的节点
+    lastSnapshotAt = 0;
+    lastEdit = null;
+    draggingSnapshotted = false;
     set({
       projectId,
       nodes,
@@ -114,7 +181,51 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       dirty: false,
       revision: 0,
       lastError: null,
-    }),
+      past: [],
+      future: [],
+    });
+  },
+
+  /*
+   * 撤销 / 重做。
+   *
+   * 只回滚「结构与位置」，不回滚运行态（runStore）—— 产物在 Asset 表里，
+   * 节点被删掉时那张图并没有消失。撤销把节点放回来，节点上的产物引用
+   * 跟着保存请求一起回写（见 graph PUT 的新建分支），于是刷新之后图还在。
+   */
+  undo: () => {
+    const { past, future, nodes, edges, revision } = get();
+    if (past.length === 0) return;
+    const prev = past[past.length - 1];
+    lastEdit = null;
+    lastSnapshotAt = 0;
+    set({
+      nodes: prev.nodes,
+      edges: prev.edges,
+      past: past.slice(0, -1),
+      future: [{ nodes, edges }, ...future].slice(0, HISTORY_LIMIT),
+      dirty: true,
+      revision: revision + 1,
+      lastError: null,
+    });
+  },
+
+  redo: () => {
+    const { past, future, nodes, edges, revision } = get();
+    if (future.length === 0) return;
+    const next = future[0];
+    lastEdit = null;
+    lastSnapshotAt = 0;
+    set({
+      nodes: next.nodes,
+      edges: next.edges,
+      past: past.concat({ nodes, edges }).slice(-HISTORY_LIMIT),
+      future: future.slice(1),
+      dirty: true,
+      revision: revision + 1,
+      lastError: null,
+    });
+  },
 
   // 拖拽期间这里会被高频调用。只更新内存，绝不发请求。
   onNodesChange: (changes) => {
@@ -127,10 +238,36 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       set({ nodes });
       return;
     }
+
+    /*
+     * 什么时候记一个撤销点：
+     *   删除         —— 每次都要记（这是最需要撤销的那个动作）
+     *   拖拽开始     —— 拖的过程中每帧都有 position 变更，只在按下那一下记
+     *   加节点 / 其他 —— 记
+     */
+    const removed = changes.some((c) => c.type === "remove");
+    const dragging = changes.some(
+      (c) => c.type === "position" && (c as { dragging?: boolean }).dragging === true
+    );
+    const dragEnded = changes.some(
+      (c) => c.type === "position" && (c as { dragging?: boolean }).dragging === false
+    );
+
+    if (removed) remember(get, set);
+    else if (dragging && !draggingSnapshotted) {
+      remember(get, set);
+      draggingSnapshotted = true;
+    }
+    if (dragEnded && !dragging) draggingSnapshotted = false;
+
     set({ nodes, dirty: true, revision: get().revision + 1 });
   },
 
   onEdgesChange: (changes) => {
+    // 连线被删 / 被加都要记。只改 selection 之类的不算
+    if (changes.some((c) => c.type === "remove" || c.type === "add")) {
+      remember(get, set);
+    }
     set({
       edges: applyEdgeChanges(changes, get().edges),
       dirty: true,
@@ -183,6 +320,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
      * 刷新后从库里读回来的边就没有 animated —— 于是"刚连的线在动、老线不动"。
      * 一个刷新就变样的样式，说明它当初就是随手加的，不值得留。
      */
+    remember(get, set);
     set({
       edges: addEdge(connection, get().edges),
       dirty: true,
@@ -194,6 +332,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   addNode: (type, position, overrides) => {
     const def = nodeRegistry[type];
     if (!def) return;
+    remember(get, set);
     set({
       nodes: [
         ...get().nodes,
@@ -219,6 +358,21 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const { nodes } = get();
     const target = nodes.find((n) => n.id === id);
     if (!target) return;
+
+    /*
+     * 参数编辑也要能撤销，但不能每敲一个字记一步。
+     *
+     * 同一个节点、同一批字段、1 秒内连续提交 → 合成一个撤销点。
+     * 换字段或停手超过 1 秒 → 记新的一步。
+     */
+    const key = `${id}:${Object.keys(patch).sort().join(",")}`;
+    const now = Date.now();
+    if (!lastEdit || lastEdit.key !== key || now - lastEdit.at > 1000) {
+      remember(get, set);
+      lastEdit = { key, at: now };
+    } else {
+      lastEdit.at = now;
+    }
 
     set({
       nodes: nodes.map((n) =>

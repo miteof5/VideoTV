@@ -59,6 +59,17 @@ export interface NodeOutputPayload {
 export interface RunStatusPayload {
   status: string;
   error?: string | null;
+  /**
+   * 本次消耗的积分。只在结束事件（succeeded / failed）里带。
+   *
+   * 为什么不单独开一个事件类型：它和结束是同一时刻发生的一件事，
+   * 拆成两条会让前端需要处理「收到了结束但积分还没到」的中间态。
+   */
+  credits?: number;
+  /** 本次有几个节点（积分旁边那个数字，让「3 个节点 120 积分」读得通） */
+  nodeCount?: number;
+  /** 该项目累计积分，顺手带给前端显示 */
+  projectCredits?: number;
 }
 
 export interface LogPayload {

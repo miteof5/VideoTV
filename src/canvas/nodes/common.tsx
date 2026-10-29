@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Handle, Position, useReactFlow, useStore } from "@xyflow/react";
-import { NODE_STATUS, RUN_STATUS } from "@/lib/constants";
+import { NODE_STATUS } from "@/lib/constants";
 import type { NodeDefinition } from "@/canvas/nodeRegistry";
 import { effectiveModel, optionsOf, paramSetOf, type ParamDef } from "@/canvas/params";
 import { useDebouncedCommit } from "@/hooks/useDebouncedCommit";
@@ -554,7 +554,6 @@ export function NodePanel({
   const projectId = useCanvasStore((s) => s.projectId);
   const updateNodeData = useCanvasStore((s) => s.updateNodeData);
   const setError = useCanvasStore((s) => s.setError);
-  const runStatus = useRunStore((s) => s.status);
   const rt = useRunStore((s) => s.runtime[nodeId]);
   const models = useModels();
   const [sending, setSending] = useState(false);
@@ -577,7 +576,16 @@ export function NodePanel({
    */
   const paramSet = paramSetOf(def);
 
-  const busy = runStatus === RUN_STATUS.PENDING || runStatus === RUN_STATUS.RUNNING;
+  /*
+   * 按钮为什么只看**本节点**在不在跑，不看全局运行状态。
+   *
+   * 原来这里有一句 `busy = 整次运行是 pending/running`，直接进 disabled。
+   * 那等于「只要有一个任务在跑，整个画布都不能点」—— 一个 30 秒的视频
+   * 要跑五到十分钟，这段时间里想顺手把另一张图出了，做不到。
+   *
+   * 服务端已经能处理并发（全局 3 个名额、重叠节点挂起等待），
+   * 前端再拦一道就只是过时的保守，代价是整块画布被锁死。
+   */
   const running = rt?.status === NODE_STATUS.RUNNING || rt?.status === NODE_STATUS.QUEUED;
 
   /**
@@ -782,7 +790,7 @@ export function NodePanel({
             <button
               type="button"
               data-action="send"
-              disabled={busy || running || sending || noModel}
+              disabled={running || sending || noModel}
               title={
                 noModel && panelCap
                   ? `${CAP_LABEL[panelCap]}模型还没接入，暂时不能生成`

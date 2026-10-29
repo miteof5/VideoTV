@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Lightbox } from "@/canvas/Lightbox";
 
 /*
  * 资产库：一个项目一个，装这个项目里出现过的所有图片和视频。
@@ -308,34 +309,16 @@ export function AssetLibrary({
         </>
       )}
 
-      {/* 预览 */}
+      {/* 预览：和画布节点共用同一个组件，两处以后不会各长一个样 */}
       {preview && (
-        <div
-          data-asset-preview
-          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/80 p-8"
-          onClick={() => setPreview(null)}
-        >
-          {preview.kind === "video" ? (
-            <video
-              src={`/api/assets/${preview.id}`}
-              controls
-              autoPlay
-              className="max-h-[80vh] max-w-full rounded-lg bg-black"
-              onClick={(e) => e.stopPropagation()}
-            />
-          ) : (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={`/api/assets/${preview.id}`}
-              alt=""
-              className="max-h-[80vh] max-w-full rounded-lg object-contain"
-            />
-          )}
-          <p className="mt-3 text-[length:var(--fs-meta)] text-[color:var(--ink-2)]">
-            {formatSize(preview.sizeBytes)} · {formatTime(preview.createdAt)} ·
-            点任意处关闭
-          </p>
-        </div>
+        <Lightbox
+          assetId={preview.id}
+          kind={preview.kind}
+          caption={`${formatSize(preview.sizeBytes)} · ${formatTime(
+            preview.createdAt
+          )}`}
+          onClose={() => setPreview(null)}
+        />
       )}
     </>
   );

@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { db } from "@/lib/db";
+import { guard, ownedProject } from "@/lib/authz";
 
 // 保存视野（相机）。与 graph 分开一条路由，理由有三：
 //
@@ -31,6 +32,21 @@ export async function PUT(
 ) {
   const { id: projectId } = await params;
 
+  const g = await guard();
+  if (g.error) return g.error;
+
+  /*
+   * 归属必须在读 body 之前确认。
+   *
+   * 否则「别人的项目 + 一个坏 body」会返回 400，「不存在的项目 + 一个坏 body」
+   * 也返回 400 —— 看起来一致，但那是因为 body 先报错，把归属差异盖住了。
+   * 只要 body 合法，两者就会分叉成 200 和 404，存在性就泄露了。
+   */
+  const owned = await ownedProject(projectId, g.user.id);
+  if (!owned) {
+    return NextResponse.json({ error: "项目不存在" }, { status: 404 });
+  }
+
   let body: ViewportBody;
   try {
     body = (await req.json()) as ViewportBody;
@@ -55,8 +71,11 @@ export async function PUT(
   // 用 updateMany 而不是 update：update 在记录不存在时抛 P2025，
   // 要另外 import Prisma 的错误类型来判断；updateMany 直接返回 count，
   // 少一层异常分支，也少一次「catch 到什么才算 404」的猜测。
+  //
+  // 归属条件就写在 where 里 —— 「不是你的项目」和「不存在」都落到 count === 0，
+  // 天然是同一个答案，不用额外分支。
   const r = await db.project.updateMany({
-    where: { id: projectId },
+    where: { id: projectId, ownerId: g.user.id },
     data: { viewCenterX: centerX, viewCenterY: centerY, viewSpan: span },
   });
 

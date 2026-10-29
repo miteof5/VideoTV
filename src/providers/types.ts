@@ -86,6 +86,23 @@ export interface ModelDescriptor {
    * 不标的话用户会以为自己做的片子真的出来了。
    */
   demo?: boolean;
+  /**
+   * 供应商对这个模型的提交频率硬限制：**每分钟最多提交几次**。
+   *
+   * ### 为什么这个数字必须写在清单里
+   *
+   * 它只对同步接口有意义 —— 千问图像是「一次请求等到出图」，文档写明
+   * 「同步接口并发不限」，唯一被打回的理由是「这一分钟提交太多次了」。
+   * 于是并发信号量对它完全是错的靶子：3 个请求同时打过去不吃亏，
+   * 但一分钟内第 6 个必然 429。
+   *
+   * 数字来自百炼官方限流文档（2026-10-29 核对），**按模型各自独立**：
+   * 同一个 API Key 下，3.0-pro 用掉 5 次不影响 3.0 的 20 次。
+   *
+   * 缺省表示「没有已知的分钟级限制」，Worker 就不节流。
+   * 宁可缺省也不猜一个假数字 —— 猜低了会白白拖慢，猜高了等于没写。
+   */
+  rateLimitPerMinute?: number;
   /** 用哪套代码跑它。缺省视为没有实现，不进清单 */
   impl?: ModelImpl;
 }
@@ -178,14 +195,27 @@ export class ProviderError extends Error {
     readonly options: {
       /** 可重试：限流、超时这类，等一会儿再来可能就好了 */
       retryable?: boolean;
+      /**
+       * 建议等多久再试（毫秒）。只有「等一会儿真的会好」的错误才该带：
+       *   限流 —— 服务端 `Retry-After` 头，没有就按模型的 RPM 推一个
+       *   服务抖动 —— 两三秒
+       * 不带也不影响重试，Worker 会退回自己的指数退避。
+       *
+       * 为什么这个值必须由 Provider 给出而不是 Worker 统一定：
+       * 不同模型的限额差一个数量级（千问图像 Pro 5 次/分钟 vs 3.0 20 次/分钟），
+       * Worker 手里没有这个信息，只能猜。猜小了必然再撞一次 429。
+       */
+      retryAfterMs?: number;
       cause?: unknown;
     } = {}
   ) {
     super(message);
     this.name = "ProviderError";
     this.retryable = options.retryable ?? false;
+    this.retryAfterMs = options.retryAfterMs;
     if (options.cause) this.cause = options.cause;
   }
 
   readonly retryable: boolean;
+  readonly retryAfterMs?: number;
 }

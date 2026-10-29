@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { guard, ownedRun } from "@/lib/authz";
 import { getRunSnapshot } from "@/lib/runService";
 
 // 运行快照：给前端首屏用的「当前状态」。
@@ -10,6 +11,15 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+
+  const g = await guard();
+  if (g.error) return g.error;
+
+  const run = await ownedRun(id, g.user.id);
+  if (!run) {
+    return NextResponse.json({ error: "运行不存在" }, { status: 404 });
+  }
+
   const snapshot = await getRunSnapshot(id);
   if (!snapshot) {
     return NextResponse.json({ error: "运行不存在" }, { status: 404 });

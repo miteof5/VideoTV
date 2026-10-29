@@ -21,12 +21,12 @@ import { CanvasNode } from "@/canvas/nodes/CanvasNode";
 //
 // 将来某类节点需要**专属 UI** 时，在这里按类型覆盖即可 ——
 // 推导出来的默认值全是 CanvasNode，覆盖一行就够。
-const shared: NodeTypes = Object.fromEntries(
-  Object.keys(nodeRegistry).map((type) => [type, CanvasNode])
+const shared: NodeTypes = Object.freeze(
+  Object.fromEntries(Object.keys(nodeRegistry).map((type) => [type, CanvasNode]))
 ) as NodeTypes;
 
-export const reactFlowNodeTypes: NodeTypes = {
+export const reactFlowNodeTypes: NodeTypes = Object.freeze({
   ...shared,
   // 例：将来 image.gen 有自己的组件时写在这里
   // [NODE_TYPE.IMAGE_GEN]: ImageNode,
-};
+}) as NodeTypes;

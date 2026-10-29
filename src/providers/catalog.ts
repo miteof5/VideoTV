@@ -103,8 +103,16 @@ export const MODEL_CATALOG: ModelDescriptor[] = [
     vendor: "阿里云百炼",
     requiresEnv: "DASHSCOPE_API_KEY",
     capabilities: ["image"],
-    // 限流 5 次/分钟，是这个模型唯一的脾气。并发超过它就是一串 429 ——
-    // Worker 的 MAX_CONCURRENCY 是 3，刚好压得住。
+    /*
+     * 5 次/分钟 —— 官方限流文档的原话是「Task submission API call limit
+     * 5 Times/Minutes」，同时写明「同步接口并发不限」。
+     *
+     * 所以它怕的是「这一分钟提交了第 6 次」，不是「同时有 3 个在跑」。
+     * 原来这里的注释写的是「Worker 并发 3 刚好压得住」—— 那是错的：
+     * 3 个请求可以在两秒内全部发完，照样把这分钟的额度吃掉大半，
+     * 第 4 个就是 429。真正的解法是 Worker 按这个数字主动排队。
+     */
+    rateLimitPerMinute: 5,
     options: { aspectRatios: DASHSCOPE_RATIOS, resolutions: DASHSCOPE_SIZES },
     impl: "dashscope.qwen-image",
   },
@@ -114,7 +122,8 @@ export const MODEL_CATALOG: ModelDescriptor[] = [
     vendor: "阿里云百炼",
     requiresEnv: "DASHSCOPE_API_KEY",
     capabilities: ["image"],
-    // 限流 20 次/分钟、单价约 Pro 的 3/4。日常调参用它，出片再用 Pro
+    // 20 次/分钟、单价约 Pro 的 3/4。日常调参用它，出片再用 Pro
+    rateLimitPerMinute: 20,
     options: { aspectRatios: DASHSCOPE_RATIOS, resolutions: DASHSCOPE_SIZES },
     impl: "dashscope.qwen-image",
   },
@@ -124,6 +133,7 @@ export const MODEL_CATALOG: ModelDescriptor[] = [
     vendor: "阿里云百炼",
     requiresEnv: "DASHSCOPE_API_KEY",
     capabilities: ["image"],
+    rateLimitPerMinute: 20,
     options: { aspectRatios: DASHSCOPE_RATIOS, resolutions: DASHSCOPE_SIZES },
     impl: "dashscope.qwen-image",
   },
@@ -133,6 +143,7 @@ export const MODEL_CATALOG: ModelDescriptor[] = [
     vendor: "阿里云百炼",
     requiresEnv: "DASHSCOPE_API_KEY",
     capabilities: ["image"],
+    rateLimitPerMinute: 120,
     options: { aspectRatios: DASHSCOPE_RATIOS, resolutions: DASHSCOPE_SIZES },
     impl: "dashscope.qwen-image",
   },
@@ -150,6 +161,7 @@ export const MODEL_CATALOG: ModelDescriptor[] = [
      * 在 registry 里加一个新分支即可 —— 其余五个模型不受影响。
      * 这也说明为什么 impl 是**每条**清单自己声明的。
      */
+    rateLimitPerMinute: 60,
     options: { aspectRatios: DASHSCOPE_RATIOS, resolutions: DASHSCOPE_SIZES },
     impl: "dashscope.qwen-image",
   },
@@ -175,6 +187,12 @@ export const MODEL_CATALOG: ModelDescriptor[] = [
     requiresEnv: "DASHSCOPE_API_KEY",
     capabilities: ["video"],
     /*
+     * 这里**没有** rateLimitPerMinute，是对的。
+     *
+     * 视频是异步协议（提交任务 → 轮询），官方限制是 RPS 5 + **同时进行中 5 个**，
+     * 异步队列能排 500 个。也就是说它怕的是「同时太多个在跑」，
+     * 恰好就是并发信号量管的那件事 —— 不需要再叠一层分钟节流。
+     *
      * 时长给到 30 秒是因为这个模型真的支持 2~30（wan2.7 只到 15）。
      * 但**按秒计费**，30 秒一条片子的花费是 5 秒的六倍 —— 选项摆在这里，
      * 花多少由用户自己决定，不在代码里替他砍掉。

@@ -8,7 +8,19 @@ import { randomUUID } from "node:crypto";
 // 存储层只负责安全地写进 ./storage，assetService 才把两者和数据库串起来。
 // 这样换存储后端（本地 → S3/R2）只改这一个文件。
 
-export const STORAGE_ROOT = path.join(process.cwd(), "storage");
+/**
+ * 二进制文件的根目录。
+ *
+ * 为什么读环境变量：验收入口（隔离库 verify.db + mock provider）跑出来的
+ * 是一批假图假视频，它们不该混进真实资产目录 —— 没有这个开关时，
+ * 「隔离验证」只能隔离数据库，文件照样落进 ./storage，跑几轮之后
+ * 真实项目里就多出一堆没人认领的测试文件。
+ *
+ * 缺省仍是 ./storage，所有现有调用方行为不变。
+ */
+export const STORAGE_ROOT = process.env.STORAGE_DIR
+  ? path.resolve(process.cwd(), process.env.STORAGE_DIR)
+  : path.join(process.cwd(), "storage");
 
 /**
  * 资产在 storage 下的相对路径。

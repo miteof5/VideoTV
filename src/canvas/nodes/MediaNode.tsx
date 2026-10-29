@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useUpdateNodeInternals, type NodeProps } from "@xyflow/react";
 import { NODE_STATUS } from "@/lib/constants";
 import type { NodeDefinition } from "@/canvas/nodeRegistry";
+import { Lightbox } from "@/canvas/Lightbox";
 import { displaySize } from "@/canvas/nodeSize";
 import { effectiveModel } from "@/canvas/params";
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -114,6 +115,8 @@ export function MediaNode({
 
   const { w, h } = displaySize(def, data);
   const [editingLabel, setEditingLabel] = useState(false);
+  /** 全屏看产物。状态放在节点里而不是画布上：同时只看一张，谁开谁管 */
+  const [zoomOpen, setZoomOpen] = useState(false);
 
   /**
    * 把产物的像素尺寸记进节点数据。
@@ -147,8 +150,19 @@ export function MediaNode({
   const enterEdit = (e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
     if (target.closest("textarea, input, select, button, a")) return;
-    // 只有双击标签才改名：双击图片本身没有意义（不提供放大，那是另一个能力）
-    if (target.closest("[data-node-label]")) setEditingLabel(true);
+    // 双击标签 → 改名
+    if (target.closest("[data-node-label]")) {
+      setEditingLabel(true);
+      return;
+    }
+    /*
+     * 双击图片 → 全屏看。
+     *
+     * 这是原来那条注释说的「不提供放大，那是另一个能力」——现在提供了。
+     * 只接管图片，不接管视频：Chrome 自己把「双击视频」绑成了全屏播放，
+     * 两个全屏叠在一起会打架（而且关掉一个还有一个）。视频用选中时那个按钮。
+     */
+    if (target.closest("img") && previewAsset) setZoomOpen(true);
   };
 
   /** 焦点离开整个节点才算退出改名。理由同卡片形态 —— 中间态会让点击落空 */
@@ -400,24 +414,37 @@ export function MediaNode({
       */}
       {selected && !dragging && (
         <>
-          {rt?.output && (
-            <a
-              href={`/api/assets/${rt.output.assetId}?dl=1`}
-              download
-              title="下载产物"
-              data-action="download"
-              /*
-               * 2026-10-26 跟叉号一起按 2 倍放大（32→64 高，14→32 字）。
-               * 只放大叉号会让两个按钮一大一小 —— 同一组操作按钮不同倍，
-               * 看起来像其中一个没加载样式。
-               *
-               * 位置从 -top-12 改 -top-20 不是拍脑袋：原来按钮底边离节点顶边
-               * 16px（-48 + 32 = -16），要保住这个间隙，64 高的按钮就得放 -80。
-               */
-              className="nodrag nopan absolute -top-20 left-1/2 z-10 flex h-16 -translate-x-1/2 items-center gap-2 whitespace-nowrap rounded-full border-[3px] border-[color:var(--line-2)] bg-[color:var(--surface-1)] px-6 text-[length:var(--fs-bare-hint)] font-medium text-[color:var(--ink-1)] shadow-[0_4px_20px_rgba(0,0,0,0.5)] transition-colors hover:border-[color:var(--line-3)]"
-            >
-              ↓ 下载
-            </a>
+          {/*
+            操作按钮组。位置与尺寸都是**画布坐标**，屏幕大小 = 设计 × zoom：
+              高度 64（2026-10-26 和叉号一起按 2 倍放大，原来 32）
+              -top-20 让按钮底边离节点顶边 16px（-80 + 64 = -16）
+              左右并排居中，两个按钮同高同圆角 —— 一大一小会被当成没加载样式
+          */}
+          {(previewAsset || rt?.output) && (
+            <div className="nodrag nopan absolute -top-20 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3">
+              {previewAsset && (
+                <button
+                  type="button"
+                  onClick={() => setZoomOpen(true)}
+                  title="全屏查看（也可以直接双击图片）"
+                  data-action="zoom"
+                  className="flex h-16 items-center gap-2 whitespace-nowrap rounded-full border-[3px] border-[color:var(--line-2)] bg-[color:var(--surface-1)] px-6 text-[length:var(--fs-bare-hint)] font-medium text-[color:var(--ink-1)] shadow-[0_4px_20px_rgba(0,0,0,0.5)] transition-colors hover:border-[color:var(--line-3)]"
+                >
+                  ⤢ 放大
+                </button>
+              )}
+              {rt?.output && (
+                <a
+                  href={`/api/assets/${rt.output.assetId}?dl=1`}
+                  download
+                  title="下载产物"
+                  data-action="download"
+                  className="flex h-16 items-center gap-2 whitespace-nowrap rounded-full border-[3px] border-[color:var(--line-2)] bg-[color:var(--surface-1)] px-6 text-[length:var(--fs-bare-hint)] font-medium text-[color:var(--ink-1)] shadow-[0_4px_20px_rgba(0,0,0,0.5)] transition-colors hover:border-[color:var(--line-3)]"
+                >
+                  ↓ 下载
+                </a>
+              )}
+            </div>
           )}
           <NodeDeleteButton nodeId={id} />
         </>
@@ -430,6 +457,23 @@ export function MediaNode({
       {selected && !dragging && !editingLabel && <NodePanel nodeId={id} def={def} data={data} />}
 
       <NodeOutputHandle />
+
+      {/*
+        全屏看产物。Lightbox 内部会 portal 到 body ——
+        它不能留在这个节点里，否则会被画布的 transform 一起缩放（见该文件注释）。
+      */}
+      {zoomOpen && previewAsset && (
+        <Lightbox
+          assetId={previewAsset.assetId}
+          kind={previewAsset.kind}
+          caption={
+            def.assetInData
+              ? String(data.assetName || data.label || "")
+              : String(data.label || "")
+          }
+          onClose={() => setZoomOpen(false)}
+        />
+      )}
     </div>
   );
 }

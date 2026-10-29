@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useReactFlow, type NodeProps } from "@xyflow/react";
 import { NODE_STATUS } from "@/lib/constants";
 import { nodeRegistry, type NodeDefinition } from "@/canvas/nodeRegistry";
@@ -12,7 +12,7 @@ import { useCanvasStore } from "@/stores/canvasStore";
 import { useUiStore } from "@/stores/uiStore";
 import { useRunStore } from "@/stores/runStore";
 import { NODE_HEIGHT, NODE_WIDTH } from "@/canvas/layout";
-import type { CanvasNode } from "@/canvas/types";
+import type { CanvasNode as CanvasNodeType } from "@/canvas/types";
 import {
   NodeDeleteButton,
   NodeInputHandles,
@@ -35,7 +35,7 @@ import { MediaNode } from "@/canvas/nodes/MediaNode";
  *
  * 加第三种形态 = 注册表加一个枚举值 + 这里加一行分派。
  */
-export function CanvasNode(props: NodeProps<CanvasNode>) {
+const CanvasNodeInner = (props: NodeProps<CanvasNodeType>) => {
   const def = nodeRegistry[props.type ?? ""];
 
   // 类型不在注册表里时不渲染裸图 —— 它需要 def 的 accepts / capability。
@@ -45,7 +45,33 @@ export function CanvasNode(props: NodeProps<CanvasNode>) {
   }
 
   return <CardNode {...props} def={def} />;
+};
+
+CanvasNodeInner.displayName = "CanvasNode";
+
+function areEqual(prev: NodeProps<CanvasNodeType>, next: NodeProps<CanvasNodeType>) {
+  if (prev.id !== next.id) return false;
+  if (prev.type !== next.type) return false;
+  if (prev.selected !== next.selected) return false;
+  if (prev.dragging !== next.dragging) return false;
+  if (prev.positionAbsoluteX !== next.positionAbsoluteX) return false;
+  if (prev.positionAbsoluteY !== next.positionAbsoluteY) return false;
+  if (prev.data !== next.data) {
+    const p = prev.data as any;
+    const n = next.data as any;
+    if (p?.status !== n?.status) return false;
+    if (p?.label !== n?.label) return false;
+    if (p?.prompt !== n?.prompt) return false;
+    if (p?.optimizedPrompt !== n?.optimizedPrompt) return false;
+    if (p?.assetId !== n?.assetId) return false;
+    if (p?.naturalW !== n?.naturalW) return false;
+    if (p?.naturalH !== n?.naturalH) return false;
+    return false;
+  }
+  return true;
 }
+
+export const CanvasNode = memo(CanvasNodeInner, areEqual);
 
 /**
  * 卡片形态：带边框、标题栏、底栏。目前只有文本节点用。
@@ -67,7 +93,7 @@ function CardNode({
   type,
   selected,
   def,
-}: NodeProps<CanvasNode> & { def?: NodeDefinition }) {
+}: NodeProps<CanvasNodeType> & { def?: NodeDefinition }) {
   // 按 id 单独订阅：任何节点的状态变化都会重建 runtime 对象，
   // 但只有 id 命中的那个引用变了，其余节点不会重渲染。
   // 这里绝不能写成 useRunStore((s) => s.runtime) —— 那会让所有节点每秒重渲染好几次。

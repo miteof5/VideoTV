@@ -7,17 +7,23 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:generate": "prisma generate",
     "db:studio": "prisma studio",
-    "worker": "tsx src/worker/index.ts"
+    "worker": "tsx src/worker/index.ts",
+    "reset-password": "tsx scripts/reset-password.ts",
+    "make-admin": "tsx scripts/make-admin.ts",
+    "claim-orphans": "tsx scripts/claim-orphans.ts"
   },
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@prisma/adapter-better-sqlite3": "^7.10.1",
     "@prisma/client": "^7.10.1",
     "@xyflow/react": "^12.12.0",
+    "better-auth": "^1.7.14",
     "dotenv": "^18.0.8",
     "next": "16.4.2",
     "react": "19.3.0",
@@ -36,6 +42,7 @@
     "puppeteer-core": "^25.15.0",
     "tailwindcss": "^4",
     "tsx": "^4.23.15",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^3.2.7"
   }
 }

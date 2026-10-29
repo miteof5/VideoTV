@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 import { db } from "@/lib/db";
+import { guard } from "@/lib/authz";
 import { RUN_STATUS } from "@/lib/constants";
 import { readSince } from "@/lib/events";
 
@@ -33,8 +34,13 @@ export async function GET(
 ) {
   const { id: runId } = await params;
 
-  const run = await db.run.findUnique({
-    where: { id: runId },
+  const g = await guard();
+  if (g.error) return g.error;
+
+  // SSE 是最容易被漏掉鉴权的地方：它不返回 JSON，容易被当成「只是个流」。
+  // 但它推的是 run 的全部事件 —— 包括节点状态、错误原文、积分。
+  const run = await db.run.findFirst({
+    where: { id: runId, project: { ownerId: g.user.id } },
     select: { id: true, status: true },
   });
   if (!run) {

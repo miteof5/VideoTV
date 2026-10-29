@@ -3,6 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { db } from "@/lib/db";
+import { getUser } from "@/lib/authz";
 import { removeFile } from "@/lib/storage";
 
 // Server Action 的选型理由：
@@ -11,18 +12,37 @@ import { removeFile } from "@/lib/storage";
 // 后面画布的自动保存、提交运行、SSE 订阅会改用 Route Handler（见 M2/M5）。
 
 export async function createProject(formData: FormData) {
+  const user = await getUser();
+  if (!user) redirect("/sign-in");
+
   const raw = String(formData.get("name") ?? "").trim();
   const name = raw || "未命名项目";
 
-  const project = await db.project.create({ data: { name } });
+  const project = await db.project.create({ data: { name, ownerId: user.id } });
 
   revalidatePath("/");
   redirect(`/projects/${project.id}`);
 }
 
 export async function deleteProject(formData: FormData) {
+  const user = await getUser();
+  if (!user) redirect("/sign-in");
+
   const id = String(formData.get("id") ?? "");
   if (!id) return;
+
+  /*
+   * 先确认这个项目是他的 —— 而且用**查不到就静默返回**的方式。
+   *
+   * 这里不能报错、不能给不同提示：这是个 Server Action，
+   * 任何区别对待都会让「这个 id 存不存在」变得可探测。
+   * 拿别人的 id 打过来，效果和打一个不存在的 id 完全一样（什么也没发生）。
+   */
+  const project = await db.project.findFirst({
+    where: { id, ownerId: user.id },
+    select: { id: true },
+  });
+  if (!project) return;
 
   /*
    * 先删文件，再删记录。

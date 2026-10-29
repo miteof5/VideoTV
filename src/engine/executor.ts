@@ -1,11 +1,12 @@
 import { db } from "@/lib/db";
-import { NODE_STATUS, JOB_STATUS } from "@/lib/constants";
+import { NODE_STATUS, JOB_STATUS, CREDIT_COST } from "@/lib/constants";
 import { resolveInStorage } from "@/lib/storage";
 import { persistOutput } from "@/lib/assetService";
 import { selectProvider } from "@/providers/registry";
 import { ProviderError, type ProviderInput } from "@/providers/types";
 import { emit, emitLog, EVENT_TYPE } from "@/lib/events";
 import type { PlanStep } from "@/engine/plan";
+import { parseNodeData } from "@/canvas/schemas/nodeData";
 
 // 执行引擎：把「一个已被抢占的 job」跑完。
 //
@@ -28,6 +29,12 @@ export interface ExecuteResult {
   assetId?: string;
   /** 可重试的失败（限流、超时），Worker 会再排一次 */
   retryable?: boolean;
+  /**
+   * 建议等多久再重试（毫秒）。限流时由 Provider 从 `Retry-After` 头取，
+   * 或者按 429 推一个缺省值（见 http.ts 的 classify）。
+   * 缺省表示"没意见"，Worker 用自己的退避策略。
+   */
+  retryAfterMs?: number;
 }
 
 /** 进度事件的最小间隔。Provider 每 200ms 回调一次，全落库会把事件表撑爆 */
@@ -135,6 +142,45 @@ export async function executeNode(ctx: ExecuteContext): Promise<ExecuteResult> {
     );
   };
 
+  /*
+   * ---- 3.5 积分记账 ----
+   *
+   * ### 什么算「消耗了一次」
+   *
+   * **请求真的发出去了就算**，成败都算。这是真实世界的规则：对面已经
+   * 开始计费了，我们这边返回失败并不退钱。所以：
+   *   - 参数校验没过 / 没有可用模型 → 请求根本没出去，**不计**
+   *   - dry run → 请求被拦在本地，**不计**
+   *   - 发出去了，超时 / 429 / 内容审核拒绝 → **计**
+   *
+   * ### 为什么在「调之前」打标记，在「调之后」才写库
+   *
+   * 需要同时满足两件事：调用前不知道会不会 dry run，调用后可能直接抛异常。
+   * 所以用一个 `dispatched` 标记表示「请求已发出」，成功分支和 catch 分支
+   * 各自决定要不要落账，`charged` 保证同一次尝试只记一次 —— 否则
+   * 「调用成功但落盘失败」会被记两遍。
+   *
+   * ### 重试要不要重复计
+   *
+   * 要。重试是又一次真实调用，钱又出去一次。`Job.credits` 是累计值，
+   * 一次 429 后再成功，这条 job 就是 20 积分（图片）。
+   * 这正是 A 阶段要让人看见的东西 —— 原来的表里根本没有这个字段。
+   */
+  const cost = step.capability ? CREDIT_COST[step.capability] : 0;
+  let dispatched = false;
+  let charged = false;
+
+  const charge = async () => {
+    if (charged || cost <= 0) return;
+    charged = true;
+    // updateMany 而不是 update：run 可能在被取消时被删掉，
+    // update 会抛「记录不存在」，把一次普通的失败升级成崩溃。
+    // 记账失败不该影响这次执行的结果 —— 积分少记一分，比任务报错强。
+    await db.job
+      .updateMany({ where: { id: jobId }, data: { credits: { increment: cost } } })
+      .catch(() => {});
+  };
+
   try {
     const provider = selectProvider(step.capability, step.modelId);
 
@@ -145,6 +191,9 @@ export async function executeNode(ctx: ExecuteContext): Promise<ExecuteResult> {
     if (invalid) {
       return fail(ctx, invalid, false);
     }
+
+    // 从这一行之后，请求就真的发出去了 —— 后面无论成败都要记账。
+    dispatched = true;
 
     const output = await provider.generate({
       prompt: step.prompt,
@@ -172,6 +221,8 @@ export async function executeNode(ctx: ExecuteContext): Promise<ExecuteResult> {
      * 放在落盘之前：万一是落盘出了问题，这条日志至少证明调用是对的。
      */
     if (output.meta?.dryRun) {
+      // 干跑：请求被拦在本地，一分钱都没出去 —— 后面即使落盘失败也不该计
+      dispatched = false;
       await emitLog(runId, [
         {
           nodeId,
@@ -179,6 +230,8 @@ export async function executeNode(ctx: ExecuteContext): Promise<ExecuteResult> {
           message: `DRY RUN 未真实调用（不扣额度）。${describeCall(output.meta.dryRunCall)}`,
         },
       ]);
+    } else {
+      await charge();
     }
 
     // 取消要优先于成功判定：模型可能在最后一刻才被中断，
@@ -221,9 +274,9 @@ export async function executeNode(ctx: ExecuteContext): Promise<ExecuteResult> {
        */
       const fresh = await db.node.findUnique({
         where: { id: nodeId },
-        select: { data: true },
+        select: { data: true, type: true },
       });
-      const merged = { ...readNodeData(fresh?.data), optimizedPrompt: text };
+      const merged = { ...readNodeData(fresh?.data, fresh?.type), optimizedPrompt: text };
 
       await db.node.update({
         where: { id: nodeId },
@@ -294,15 +347,46 @@ export async function executeNode(ctx: ExecuteContext): Promise<ExecuteResult> {
 
     return { status: "succeeded", assetId: asset.id };
   } catch (err) {
+    /*
+     * 记账放在最前面，连「已取消」也要过一遍。
+     *
+     * 用户点停止时，请求往往已经发出去几十秒了 —— 上游照跑、照收费。
+     * 只有「请求没发出去就失败」才不该计费，而那种情况 dispatched 还是 false。
+     */
+    if (dispatched) await charge();
+
     if (signal.aborted) {
       return fail(ctx, "已取消", false, true);
     }
-    if (isTimeout(err, timer)) {
-      return fail(ctx, `执行超时（超过 ${Math.round(timeoutMs / 1000)} 秒）`, true);
+    if (isTimeout(timer, signal)) {
+      /*
+       * 超时**不重试**（2026-10-28 改，原来这里是 true）。
+       *
+       * 超时和其它可重试错误有一个本质差别：**请求已经发出去了，对面的账
+       * 已经开始算**。重试等于让同一个任务在平台侧跑第二遍 —— 视频按秒计费，
+       * 30 秒的片子重跑一次是六倍价钱，而第一遍很可能在平台那边还在跑。
+       *
+       * 真正还能重试的只剩「连接都没建立起来」那一类（DNS、代理、握手失败），
+       * 那些由 providers/dashscope/http.ts 的 fetch catch 判成 retryable，
+       * 根本到不了这里。
+       *
+       * 代价：如果超时其实是网络慢、请求没到，用户得手动再点一次。
+       * 这是明确选择的 —— 宁可多一次手动，不静默多扣一次钱。
+       */
+      return fail(
+        ctx,
+        `执行超时（超过 ${formatTimeout(timeoutMs)}）`,
+        false
+      );
     }
     const retryable = err instanceof ProviderError ? err.retryable : false;
+    // 限流建议等待时长由 Provider 给出（Retry-After 头，或按 429 推的 12 秒）。
+    // 不带出去的话 Worker 只能退回 1 秒起步，而 1 秒对一个 5 次/分钟的
+    // 模型等于没等 —— 必再撞一次，然后标红。
+    const retryAfterMs =
+      err instanceof ProviderError ? err.retryAfterMs : undefined;
     const message = err instanceof Error ? err.message : String(err);
-    return fail(ctx, message, retryable);
+    return fail(ctx, message, retryable, false, retryAfterMs);
   }
 }
 
@@ -380,9 +464,13 @@ async function collectInputs(step: PlanStep): Promise<ProviderInput[]> {
  *
  * 读不出来就返回空对象，不抛 —— 这一列是用户可改、老版本可写的，
  * 遇到一条坏数据时让整次执行崩掉，比丢一个字段严重得多。
+ * 现在使用 schema 验证以提高类型安全性。
  */
-function readNodeData(raw: string | null | undefined): Record<string, unknown> {
+function readNodeData(raw: string | null | undefined, type?: string): Record<string, unknown> {
   if (!raw) return {};
+  if (type) {
+    return parseNodeData(type, raw);
+  }
   try {
     const parsed = JSON.parse(raw);
     return typeof parsed === "object" && parsed !== null ? parsed : {};
@@ -444,10 +532,28 @@ function checkOptions(
   return null;
 }
 
-function isTimeout(err: unknown, timer: AbortSignal): boolean {
-  if (!timer.aborted) return false;
-  const msg = err instanceof Error ? err.message : "";
-  return /abort|timeout|cancel/i.test(msg);
+/** 超时时长说成人话。真实值都是分钟级，但测试里会传 200ms —— 那不该显示成「0 秒」 */
+function formatTimeout(ms: number) {
+  const secs = ms / 1000;
+  return secs >= 1 ? `${Math.round(secs)} 秒` : `${ms} 毫秒`;
+}
+
+/**
+ * 这次失败算不算「超时」。
+ *
+ * 判据是 `timer.aborted && !external.aborted` —— 看信号，**不去猜错误消息**。
+ *
+ * 原来靠 `/abort|timeout|cancel/` 匹配 message，看着能用，漏得很具体：
+ * `sleepAbortable` 取消时抛的是中文「已取消」，一个关键词都不匹配。
+ * 于是红线触发的超时被当成普通取消，用户在节点底部读到"已取消"，
+ * 而他从没点过取消；更要紧的是它绕过了"超时不重试"那条判断。
+ * 这类「文案一改就静默失效」的判断不该出现在钱的路径上。
+ *
+ * 两个信号的职责很清楚：timer 只在 executor 自己 `AbortSignal.timeout()`
+ * 到点时 aborted，external 只在用户取消 / worker 退出时 aborted。
+ */
+function isTimeout(timer: AbortSignal, external: AbortSignal): boolean {
+  return timer.aborted && !external.aborted;
 }
 
 /** 超长文本截断，用于日志。换行压成 ` / `，否则一行日志会变成一片空白墙 */
@@ -501,7 +607,8 @@ async function fail(
   ctx: ExecuteContext,
   message: string,
   retryable: boolean,
-  cancelled = false
+  cancelled = false,
+  retryAfterMs?: number
 ): Promise<ExecuteResult> {
   const { runId, jobId, step } = ctx;
   const status = cancelled ? NODE_STATUS.IDLE : NODE_STATUS.FAILED;
@@ -536,5 +643,6 @@ async function fail(
     status: cancelled ? "cancelled" : "failed",
     error: message,
     retryable,
+    retryAfterMs,
   };
 }

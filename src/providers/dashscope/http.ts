@@ -166,10 +166,12 @@ export async function callDashScope<T>(args: CallArgs): Promise<T> {
     if (args.signal?.aborted) {
       throw new ProviderError("已取消", { retryable: false, cause: err });
     }
-    // 网络层失败（DNS、连接重置、代理）—— 等一会儿可能就好了
+    // 网络层失败（DNS、连接重置、代理）—— 等一会儿可能就好了。
+    // 这类失败的共性是**请求没到服务端**，所以重试不会造成重复生成，
+    // 和「超时」有本质区别（超时那条见 engine/executor.ts 的注释）。
     throw new ProviderError(
       `请求百炼失败：${err instanceof Error ? err.message : String(err)}`,
-      { retryable: true, cause: err }
+      { retryable: true, retryAfterMs: 2_000, cause: err }
     );
   }
 
@@ -206,10 +208,47 @@ export async function callDashScope<T>(args: CallArgs): Promise<T> {
   const message = d.message ?? d.error?.message ?? d.output?.message;
 
   if (!res.ok || code) {
-    throw classify(res.status, code, message);
+    throw classify(
+      res.status,
+      code,
+      message,
+      // 限流响应通常带 Retry-After。有就用它（服务端最清楚自己什么时候松口），
+      // 没有就让 classify 按状态码给一个缺省值。
+      parseRetryAfterMs(res.headers.get("retry-after"))
+    );
   }
 
   return data as T;
+}
+
+/**
+ * 解析 `Retry-After` 头。
+ *
+ * 两种格式都要认，这是 HTTP 的规定：
+ *   - 秒数：`Retry-After: 12`
+ *   - HTTP 日期：`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`
+ *
+ * 两种情况都夹一个 5 分钟上限。理由：这个值会被直接拿去 sleep，
+ * 服务端一时抽风给个 `86400` 就等于把任务挂死一天 —— 而重试的目的
+ * 是"尽快恢复"，不是"永远等下去"。真等不起的时候，让节点失败
+ * 比让用户盯着一个永远转圈的卡片好。
+ */
+export function parseRetryAfterMs(raw: string | null): number | undefined {
+  if (!raw) return undefined;
+  const MAX = 5 * 60_000;
+
+  const secs = Number(raw);
+  if (Number.isFinite(secs) && secs >= 0) {
+    return Math.min(secs * 1000, MAX);
+  }
+
+  const at = Date.parse(raw);
+  if (Number.isFinite(at)) {
+    const delta = at - Date.now();
+    return delta > 0 ? Math.min(delta, MAX) : 0;
+  }
+
+  return undefined;
 }
 
 /**
@@ -219,7 +258,12 @@ export async function callDashScope<T>(args: CallArgs): Promise<T> {
  * 额度用尽判成可重试 → 白白重试一遍再失败，日志里还多一条误导信息；
  * 限流判成不可重试 → 明明等十秒就能过的任务直接标失败。
  */
-function classify(status: number, code?: string, message?: string) {
+export function classify(
+  status: number,
+  code?: string,
+  message?: string,
+  retryAfterMs?: number
+) {
   const msg = message || code || `HTTP ${status}`;
 
   /*
@@ -245,15 +289,30 @@ function classify(status: number, code?: string, message?: string) {
     );
   }
 
-  // 限流 / 服务端抖动：等一会儿真的会好
-  if (
+  /*
+   * 限流 / 服务端抖动：等一会儿真的会好。
+   *
+   * 这两类都"可重试"，但**该等多久差一个数量级**，所以必须分头给值：
+   *   限流  —— 12 秒起步。千问图像 Pro 是 5 次/分钟，等于 12 秒才放一张。
+   *            Worker 原来固定 1 秒退避，在 5 次/分钟面前几乎必然再撞一次，
+   *            第二次就用光了尝试次数 → 节点标红 → 用户以为模型坏了。
+   *   5xx  —— 2 秒。服务端抖动恢复得快，等太久反而拖慢整条流水线。
+   */
+  const throttled =
     status === 429 ||
-    status >= 500 ||
     code === "Throttling" ||
-    code?.startsWith("Throttling.") ||
-    code === "InternalError"
-  ) {
-    return new ProviderError(`百炼限流或服务异常：${msg}`, { retryable: true });
+    code?.startsWith("Throttling.");
+  const serverFault = status >= 500 || code === "InternalError";
+
+  if (throttled || serverFault) {
+    return new ProviderError(
+      `${throttled ? "百炼限流" : "百炼服务异常"}：${msg}`,
+      {
+        retryable: true,
+        // 服务端给了 Retry-After 就听它的 —— 它比我们清楚什么时候松口
+        retryAfterMs: retryAfterMs ?? (throttled ? 12_000 : 2_000),
+      }
+    );
   }
 
   // 内容审核：同一段提示词重试一百次也还是被拒，重试只是多花钱

@@ -1,8 +1,10 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { randomUUID } from "node:crypto";
 import { db } from "@/lib/db";
+import { guard } from "@/lib/authz";
 import { assetRelPath, writeFileAtomic } from "@/lib/storage";
 import { ASSET_KIND } from "@/lib/constants";
+import { parseNodeData } from "@/canvas/schemas/nodeData";
 
 // 素材上传。
 //
@@ -84,8 +86,11 @@ export async function GET(
 ) {
   const { id: projectId } = await params;
 
-  const project = await db.project.findUnique({
-    where: { id: projectId },
+  const g = await guard();
+  if (g.error) return g.error;
+
+  const project = await db.project.findFirst({
+    where: { id: projectId, ownerId: g.user.id },
     select: { id: true },
   });
   if (!project) {
@@ -120,7 +125,7 @@ export async function GET(
   for (const n of nodes) {
     bump(n.outputAssetId);
     try {
-      const data = JSON.parse(n.data) as { assetId?: unknown };
+      const data = parseNodeData("", n.data);
       if (typeof data.assetId === "string") bump(data.assetId);
     } catch {
       // data 坏了的节点不该让整个资产库打不开。跳过即可，
@@ -147,10 +152,14 @@ export async function POST(
 ) {
   const { id: projectId } = await params;
 
-  // 项目必须存在。不校验的话，传错 id 也能成功，
+  const g = await guard();
+  if (g.error) return g.error;
+
+  // 项目必须存在**且是你的**。不校验归属的话，任何人都能往别人项目里塞资产；
+  // 只校验存在不校验归属的话，传错 id 也能成功，
   // 然后在 storage 里留下一堆没有任何项目引用的孤儿文件。
-  const project = await db.project.findUnique({
-    where: { id: projectId },
+  const project = await db.project.findFirst({
+    where: { id: projectId, ownerId: g.user.id },
     select: { id: true },
   });
   if (!project) {

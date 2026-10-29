@@ -2,6 +2,7 @@ import { db } from "@/lib/db";
 import { topoSortBatches, buildAdjacency, type GraphEdge } from "@/engine/cycleDetect";
 import { nodeRegistry } from "@/canvas/nodeRegistry";
 import { mainText } from "@/canvas/promptText";
+import { parseNodeData } from "@/canvas/schemas/nodeData";
 
 // 执行计划：把「画布上的一张图」翻译成「一批可以按顺序执行的步骤」。
 //
@@ -130,7 +131,7 @@ export async function buildPlan(
     }),
   ]);
 
-  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const byId = new Map(nodes.map((n) => [n.id, { ...n, data: JSON.stringify(parseNodeData(n.type, n.data)) }]));
   // 带上 targetHandle：端口信息是「这条线接的是首帧还是尾帧」的唯一来源
   const graphEdges: (GraphEdge & { targetHandle?: string | null })[] = edges.filter(
     (e) => byId.has(e.source) && byId.has(e.target)

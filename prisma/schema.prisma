@@ -19,6 +19,21 @@ model Project {
   updatedAt DateTime @updatedAt
 
   /*
+   * 归属的人。
+   *
+   * **可为空**，只为给存量数据（认证功能上线前建的 2 个项目）一个过渡期 ——
+   * 迁移时它们是「无主」的，由 `scripts/claim-orphans.ts` 挂到管理员名下。
+   * 新建项目一律必填（代码层保证，不靠数据库，因为 SQLite 加非空列要给默认值，
+   * 而一个假的默认用户比空值更糟）。
+   *
+   * 为什么 onDelete: Cascade：删用户就把他的项目一起删。
+   * 这跟「删项目会连资产文件一起删」是同一条规矩 —— 不留半截，
+   * 但删除动作本身必须由脚本/界面明确发起。
+   */
+  ownerId   String?
+  owner     user?    @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  /*
    * 上次离开时的视野（相机）。三个同时为 null = 从没存过，走自动取景。
    *
    * ### 为什么存「中心点 + 世界宽度」，而不是存 zoom
@@ -49,6 +64,8 @@ model Project {
   edges  Edge[]
   runs   Run[]
   assets Asset[]
+
+  @@index([ownerId])
 }
 
 // 画布上的一个节点。type 决定它是什么，data(JSON) 存它自己的配置
@@ -137,15 +154,64 @@ model Run {
   id        String    @id @default(cuid())
   projectId String
   project   Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /**
+   * 谁点的这次运行。
+   *
+   * 为什么冗余一列（project 已经能追到人）：并发名额要按人算，
+   * 「这个人现在有几个活跃 run」是每次提交都要问的问题，
+   * 走 project 反查要多一次 join 或一次子查询。一列换一次查询，值。
+   *
+   * null = 认证上线前的老 run（当前库里 0 条）。
+   */
+  userId    String?
+  user      user?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   status    String    @default("pending") // pending|running|succeeded|failed|cancelled
   startedAt DateTime?
   endedAt   DateTime?
   createdAt DateTime  @default(now())
 
+  /**
+   * 这次点的是哪个节点（node / branch 模式的 targetId）。
+   *
+   * 为什么落库：并发放开之后，「这条 run 在跑谁」必须能从库里读出来 ——
+   * 两个标签页点同一个节点时靠它做幂等（已有活跃 run 就把 id 还回去），
+   * 而 Job 表只能看出「包含着哪些节点」，看不出「用户点的是哪一个」。
+   * null = 迁移前的老 run，或 Worker 重算的全图计划。
+   */
+  targetId String?
+
+  /**
+   * 本次消耗的积分。跑完时由 Job.credits 求和写入。
+   *
+   * 为什么不在查询时现算：项目页要显示累计积分，一条 aggregate 就够；
+   * 而 run 结束后再算一次会让「历史花了多少」随着 Job 被清理而漂移。
+   * 落成一列，是给「以后要能对账」留的锚点。
+   */
+  credits Int @default(0)
+
+  /**
+   * 正在等哪些节点跑完（JSON 数组，存 node id）。
+   *
+   * 场景：一张图 + 两个不同提示词各跑一个视频。第二个 run 发现图正被
+   * 第一个 run 处理，就挂起等它 —— 而不是各跑一遍（那会得到两张不同的图，
+   * 正违背「用同一张图」的本意，还多扣 10 积分）。
+   *
+   * 为什么用字符串存 JSON 而不是关联表：这是一份**临时的调度状态**，
+   * 查询方式永远是「整份读出 / 整份清空」，从不按元素检索。
+   * 建表会让 createRun 多一次写入，收益为零。
+   */
+  waitingOn    String?
+  /** 开始等待的时间。用来兜 10 分钟上限，防止上游永久卡死把这条 run 一直挂着 */
+  waitingSince DateTime?
+
   jobs   Job[]
   events RunEvent[]
 
   @@index([projectId])
+  @@index([status])
+  @@index([userId, status])
 }
 
 // 一个节点的一次执行。batch 冗余存批次号，前端渲染进度不必重算拓扑
@@ -167,6 +233,15 @@ model Job {
   status    String   @default("pending")
   attempts  Int      @default(0)
   lastError String?
+
+  /**
+   * 这条 job 累计消耗的积分。
+   *
+   * **重试会累加** —— 这是对的：重试意味着又一次真实调用，钱又出去一次。
+   * 所以它是「这条 job 花掉的总额」，不是「一次调用的单价」。
+   * 单价在 lib/constants.ts 的 CREDIT_COST 里，按能力算，不按时长。
+   */
+  credits Int @default(0)
 
   // ---- 抢占与回收 ----
   // lockedBy：抢到这个 job 的 worker 实例 id
@@ -207,4 +282,100 @@ model RunEvent {
   createdAt DateTime @default(now())
 
   @@index([runId, seq])
+}
+
+// ============================================================================
+// 认证（Better Auth）
+// ============================================================================
+//
+// ### 为什么 model 名是小写的 user / session / account / verification
+//
+// Better Auth 的 Prisma 适配器按「表名」查找：它拿到 modelName="user" 就去
+// `db.user` 上做增删改查。Prisma 生成的客户端属性名是 model 名的首字母小写，
+// 所以 model 叫 User 时 db.user 也存在、也能跑通。
+// 但这里刻意用小写，是为了**让 model 名和适配器期望的名字完全一致** ——
+// 少一层「靠 Prisma 的命名转换恰好对上」的隐含依赖，将来换版本时不容易莫名其妙断掉。
+//
+// ### 为什么这些表没有 @@map
+//
+// Better Auth 不关心物理表名，只关心客户端属性。省掉映射，迁移和排查时少一层转换。
+//
+// ### 字段是照 getAuthTables() 的真实输出写的
+//
+// 不是照文档抄的。`scripts/_dump-schema.ts` 打印出运行时要求的确切字段、
+// 可空性、唯一约束和级联规则，这里逐条对应。
+
+model user {
+  id              String   @id
+  name            String
+  email           String   @unique
+  emailVerified   Boolean  @default(false)
+  image           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // username 插件加的两列。username 是归一化后的唯一标识（大小写不敏感），
+  // displayUsername 存用户输入的原始形态，只为显示。
+  username        String?  @unique
+  displayUsername String?
+
+  // 本站自己加的：admin | user。提权靠命令行脚本，不靠「谁先注册」。
+  role            String   @default("user")
+
+  sessions        session[]
+  accounts        account[]
+  projects        Project[]
+  runs            Run[]
+}
+
+model session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 两个只用于排查的字段：出问题时能看出「这条会话是从哪台机器登进来的」
+  ipAddress String?
+  userAgent String?
+
+  userId    String
+  user      user     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  user      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+
+  // 密码的哈希就存在这里（providerId = "credential" 的那一行）。
+  // 明文密码从不落库，也从不经过我们的代码。
+  password              String?
+
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+}
+
+model verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
 }

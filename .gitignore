@@ -56,6 +56,8 @@ next-env.d.ts
 # 项目内的协作记忆与决策日志（本地私有，不进版本库）
 /.workbuddy
 /DECISIONS.md
+# spec 是内部决策记录（含拍板过程、运维细节、验收截图），一律不公开
+/specs
 
 # 设计基准文档（本地保留，不公开）
 /ARCHITECTURE.md

@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { db } from "@/lib/db";
+import { guard } from "@/lib/authz";
 import { createRun } from "@/lib/runService";
 
 // 提交运行。
@@ -13,6 +14,10 @@ import { createRun } from "@/lib/runService";
 const MODES = ["node", "branch"] as const;
 
 export async function POST(req: NextRequest) {
+  const g = await guard();
+  if (g.error) return g.error;
+  const { user } = g;
+
   const body = (await req.json().catch(() => ({}))) as {
     projectId?: string;
     mode?: string;
@@ -48,11 +53,12 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const project = await db.project.findUnique({
-    where: { id: projectId },
+  const project = await db.project.findFirst({
+    where: { id: projectId, ownerId: user.id },
     select: { id: true },
   });
   if (!project) {
+    // 别人的项目和不存在项目给同一个答案 —— 见 lib/authz.ts 的说明
     return NextResponse.json({ error: "项目不存在" }, { status: 404 });
   }
 
@@ -61,6 +67,7 @@ export async function POST(req: NextRequest) {
       mode: mode as "node" | "branch",
       targetId: body.targetId,
       action: body.action,
+      userId: user.id,
     });
     return NextResponse.json(result);
   } catch (err) {

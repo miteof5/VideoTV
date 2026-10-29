@@ -306,6 +306,18 @@ const MOCK_LATENCY: Record<string, number> = {
   "mock.video.v1": 1800,
 };
 
+/**
+ * 把演示延迟整体放大（`MOCK_LATENCY_SCALE=8` → 图片 9.6 秒）。
+ *
+ * 为什么需要：验「三条任务真的同时在跑」时，1.2 秒的出图时间比
+ * 三次点击之间的间隔还短 —— 第一张图在你点第三个节点之前就完了，
+ * 于是验收只能证明「串行也能过」，证明不了并发。
+ *
+ * 只影响 mock，真实模型不受影响（它们的耗时本来就以分钟计）。
+ * 缺省 1，等于不改变任何现有行为。
+ */
+const LATENCY_SCALE = Math.max(1, Number(process.env.MOCK_LATENCY_SCALE) || 1);
+
 export function createMockFromDescriptor(desc: ModelDescriptor): ModelProvider {
   const capability = desc.capabilities[0];
   if (!capability) {
@@ -316,6 +328,6 @@ export function createMockFromDescriptor(desc: ModelDescriptor): ModelProvider {
     label: desc.label,
     capability,
     options: desc.options,
-    latencyMs: MOCK_LATENCY[desc.id] ?? 1000,
+    latencyMs: (MOCK_LATENCY[desc.id] ?? 1000) * LATENCY_SCALE,
   });
 }

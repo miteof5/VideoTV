@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { db } from "@/lib/db";
+import { guard } from "@/lib/authz";
 import { readFile, removeFile } from "@/lib/storage";
 
 /**
@@ -28,7 +29,14 @@ export async function DELETE(
 ) {
   const { id } = await params;
 
-  const asset = await db.asset.findUnique({ where: { id } });
+  const g = await guard();
+  if (g.error) return g.error;
+
+  // 归属经由项目判断：资产属于项目，项目属于人。
+  // 查不到（包括「存在但不是你的」）一律走同一个 404。
+  const asset = await db.asset.findFirst({
+    where: { id, project: { ownerId: g.user.id } },
+  });
   if (!asset) {
     return NextResponse.json({ error: "资产不存在" }, { status: 404 });
   }
@@ -71,7 +79,12 @@ export async function GET(
 ) {
   const { id } = await params;
 
-  const asset = await db.asset.findUnique({ where: { id } });
+  const g = await guard();
+  if (g.error) return g.error;
+
+  const asset = await db.asset.findFirst({
+    where: { id, project: { ownerId: g.user.id } },
+  });
   if (!asset) {
     return new NextResponse("Not Found", { status: 404 });
   }
@@ -90,8 +103,13 @@ export async function GET(
 
   const baseHeaders: Record<string, string> = {
     "Content-Type": asset.mimeType,
-    // 资产 id 是随机 uuid，内容永不变，可以长缓存
-    "Cache-Control": "public, max-age=31536000, immutable",
+    // **private，不是 public**。
+    //
+    // 资产 id 是随机 uuid、内容永不变，本来可以长缓存。但 `public` 的含义是
+    // 「任何中间代理、CDN 都能存这份响应并给下一个人」—— 一旦前面挂了 CDN，
+    // A 的图就可能被端给 B。改成 private 后只有浏览器自己的私有缓存会保留，
+    // 该有的缓存收益还在，共享缓存的泄露路径没了。
+    "Cache-Control": "private, max-age=31536000, immutable",
     "Accept-Ranges": "bytes",
     /*
      * 禁止浏览器「猜」类型。
